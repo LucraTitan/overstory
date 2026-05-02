@@ -4,6 +4,7 @@ import { useParams } from "react-router-dom";
 
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { CodeBlock } from "@/components/ui/code-block";
 import { useAutoScroll } from "@/lib/use-auto-scroll";
 import { useScrollFade } from "@/lib/use-scroll-fade";
 import { type Frame, type StoredEvent, useWebSocket, type WsStatus } from "@/lib/ws";
@@ -166,7 +167,7 @@ export function AgentDetail() {
 							<CardContent>
 								<p className="text-sm text-muted-foreground leading-relaxed">
 									Nudge the agent to wake it up:{" "}
-									<code className="font-mono text-xs bg-muted px-1.5 py-0.5 rounded">{`ov nudge ${agentLabel} "Status check"`}</code>
+									<CodeBlock>{`ov nudge ${agentLabel} "Status check"`}</CodeBlock>
 								</p>
 							</CardContent>
 						</Card>

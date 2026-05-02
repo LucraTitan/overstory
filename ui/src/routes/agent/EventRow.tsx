@@ -1,7 +1,7 @@
-import { useState } from "react";
-
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { CodeBlock } from "@/components/ui/code-block";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import type { EventType, StoredEvent } from "@/lib/ws";
 
 // ── Category discrimination ─────────────────────────────────────────────────
@@ -97,32 +97,27 @@ function ToolUseRow({ event }: { event: StoredEvent }) {
 }
 
 function ToolResultRow({ event }: { event: StoredEvent }) {
-	const [expanded, setExpanded] = useState(false);
 	const label = `${event.toolName ?? "tool"} OK${event.toolDurationMs != null ? ` ${event.toolDurationMs}ms` : ""}`;
 
 	return (
-		<Card className="py-3 gap-2">
-			<CardHeader className="px-4 pb-0 pt-0">
-				<div className="flex items-center gap-2">
-					<Badge variant="outline">result</Badge>
-					<span className="text-xs text-muted-foreground font-mono">{label}</span>
-					<button
-						type="button"
-						className="ml-auto text-xs text-muted-foreground hover:text-foreground"
-						onClick={() => setExpanded((v) => !v)}
-					>
-						{expanded ? "[-]" : "[+]"}
-					</button>
-				</div>
-			</CardHeader>
-			{expanded && event.data && (
-				<CardContent className="px-4 pt-2">
-					<pre className="text-xs bg-muted rounded p-2 overflow-x-auto whitespace-pre-wrap">
-						{event.data}
-					</pre>
-				</CardContent>
-			)}
-		</Card>
+		<Collapsible>
+			<Card className="py-3 gap-2">
+				<CardHeader className="px-4 pb-0 pt-0">
+					<div className="flex items-center gap-2">
+						<Badge variant="outline">result</Badge>
+						<span className="text-xs text-muted-foreground font-mono">{label}</span>
+						<CollapsibleTrigger className="ml-auto" />
+					</div>
+				</CardHeader>
+				{event.data && (
+					<CollapsibleContent>
+						<CardContent className="px-4 pt-2">
+							<CodeBlock variant="block">{event.data}</CodeBlock>
+						</CardContent>
+					</CollapsibleContent>
+				)}
+			</Card>
+		</Collapsible>
 	);
 }
 

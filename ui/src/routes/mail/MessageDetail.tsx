@@ -2,6 +2,8 @@ import { useQuery } from "@tanstack/react-query";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { CodeBlock } from "@/components/ui/code-block";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { fetchMessage } from "@/lib/api";
 import type { MailMessage, MailMessageType } from "./types.ts";
@@ -32,7 +34,9 @@ function MessageRow({ msg }: { msg: MailMessage }) {
 			<span className="text-xs text-muted-foreground">
 				{msg.from} → {msg.to}
 			</span>
-			<pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed mt-2">{msg.body}</pre>
+			<CodeBlock variant="block" className="mt-2">
+				{msg.body}
+			</CodeBlock>
 		</div>
 	);
 }
@@ -99,28 +103,26 @@ export function MessageDetail({ messageId, onReply }: MessageDetailProps) {
 
 				{/* Body */}
 				<div className="px-6 py-4 border-b border-border">
-					<pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed">
-						{message.body}
-					</pre>
+					<CodeBlock variant="block">{message.body}</CodeBlock>
 				</div>
 
 				{/* Payload */}
 				{message.payload !== null && (
 					<div className="px-6 py-4 border-b border-border">
-						<details>
-							<summary className="text-xs text-muted-foreground cursor-pointer select-none hover:text-foreground transition-colors">
-								Payload
-							</summary>
-							<pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed mt-3">
-								{(() => {
-									try {
-										return JSON.stringify(JSON.parse(message.payload ?? ""), null, 2);
-									} catch {
-										return message.payload ?? "";
-									}
-								})()}
-							</pre>
-						</details>
+						<Collapsible>
+							<CollapsibleTrigger>Payload</CollapsibleTrigger>
+							<CollapsibleContent className="mt-3">
+								<CodeBlock variant="block">
+									{(() => {
+										try {
+											return JSON.stringify(JSON.parse(message.payload ?? ""), null, 2);
+										} catch {
+											return message.payload ?? "";
+										}
+									})()}
+								</CodeBlock>
+							</CollapsibleContent>
+						</Collapsible>
 					</div>
 				)}
 

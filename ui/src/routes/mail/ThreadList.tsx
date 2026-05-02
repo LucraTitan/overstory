@@ -1,6 +1,7 @@
 import { Trash2 } from "lucide-react";
 import { useRef } from "react";
 import { Badge } from "@/components/ui/badge";
+import { CodeBlock } from "@/components/ui/code-block";
 import { useScrollFade } from "@/lib/use-scroll-fade";
 import type { MailMessage, MailMessageType } from "./types.ts";
 
@@ -37,9 +38,9 @@ export function ThreadList({ items, selectedId, onSelect, onDelete }: ThreadList
 				<p>No messages.</p>
 				<p className="leading-relaxed max-w-md">
 					Send one with{" "}
-					<code className="font-mono text-xs bg-muted px-1.5 py-0.5 rounded">
+					<CodeBlock>
 						{`ov mail send --to coordinator --subject "..." --body "..." --type status`}
-					</code>
+					</CodeBlock>
 					.
 				</p>
 			</div>

@@ -1,6 +1,7 @@
 import { useNavigate } from "react-router-dom";
 
 import { Badge } from "@/components/ui/badge";
+import { CodeBlock } from "@/components/ui/code-block";
 import {
 	Table,
 	TableBody,
@@ -45,10 +46,7 @@ export function AgentTable({ agents }: AgentTableProps) {
 		return (
 			<p className="text-sm text-muted-foreground py-4 leading-relaxed">
 				No agents in this run yet — spawn one with{" "}
-				<code className="font-mono text-xs bg-muted px-1.5 py-0.5 rounded">
-					{"ov sling <task-id> --capability builder --name <name>"}
-				</code>
-				.
+				<CodeBlock>{"ov sling <task-id> --capability builder --name <name>"}</CodeBlock>.
 			</p>
 		);
 	}
