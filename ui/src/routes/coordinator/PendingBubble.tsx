@@ -54,7 +54,7 @@ function Spinner({ stalled }: { stalled: boolean }) {
 	return (
 		<span
 			aria-hidden="true"
-			className={`inline-block size-3 rounded-full border-2 ${color} border-t-transparent animate-spin`}
+			className={`inline-block size-3 rounded-full border-2 ${color} border-t-transparent animate-spin motion-reduce:animate-none`}
 		/>
 	);
 }

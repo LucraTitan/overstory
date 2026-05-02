@@ -71,7 +71,15 @@ export function AgentTable({ agents }: AgentTableProps) {
 						<TableRow
 							key={agent.id}
 							className="cursor-pointer"
+							tabIndex={0}
+							role="button"
 							onClick={() => navigate(`/agents/${encodeURIComponent(agent.agentName)}`)}
+							onKeyDown={(e) => {
+								if (e.key === "Enter" || e.key === " ") {
+									e.preventDefault();
+									navigate(`/agents/${encodeURIComponent(agent.agentName)}`);
+								}
+							}}
 						>
 							<TableCell className="font-mono text-xs px-4 py-3">{agent.agentName}</TableCell>
 							<TableCell className="px-4 py-3 text-sm">{agent.capability}</TableCell>

@@ -55,7 +55,7 @@ export function ThreadList({ items, selectedId, onSelect, onDelete }: ThreadList
 							type="button"
 							onClick={() => onSelect(msg.id)}
 							className={[
-								"w-full flex flex-col gap-1.5 px-4 py-3 text-left border-b border-border hover:bg-accent/40 transition-colors",
+								"w-full flex flex-col gap-1.5 px-4 py-3 text-left border-b border-border hover:bg-accent/40 transition-colors outline-none focus-visible:ring-ring/50 focus-visible:ring-[3px] focus-visible:ring-inset",
 								selectedId === msg.id ? "bg-accent text-accent-foreground" : "",
 							].join(" ")}
 						>
@@ -78,7 +78,7 @@ export function ThreadList({ items, selectedId, onSelect, onDelete }: ThreadList
 									e.stopPropagation();
 									onDelete(msg.id);
 								}}
-								className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity rounded-md p-1.5 text-muted-foreground hover:text-destructive hover:bg-accent"
+								className="absolute top-2 right-2 opacity-60 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity rounded-md p-1.5 text-muted-foreground hover:text-destructive hover:bg-accent outline-none focus-visible:ring-ring/50 focus-visible:ring-[3px]"
 							>
 								<Trash2 className="size-3.5" />
 							</button>

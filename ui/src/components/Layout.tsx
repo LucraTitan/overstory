@@ -73,7 +73,7 @@ function NavItem({ to, label, end }: { to: string; label: string; end?: boolean 
 			end={end}
 			className={({ isActive }) =>
 				cn(
-					"px-3 py-1.5 rounded-md text-sm transition-colors",
+					"px-3 py-1.5 rounded-md text-sm transition-colors outline-none focus-visible:ring-ring/50 focus-visible:ring-[3px]",
 					isActive
 						? "bg-accent text-accent-foreground font-medium"
 						: "text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground",
