@@ -14,7 +14,12 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Command } from "commander";
-import { startTurnRunnerMailLoop, type TurnRunnerFn } from "../agents/headless-mail-injector.ts";
+import { isPersistentCapability } from "../agents/capabilities.ts";
+import {
+	startPersistentMailLoop,
+	startTurnRunnerMailLoop,
+	type TurnRunnerFn,
+} from "../agents/headless-mail-injector.ts";
 import { createManifestLoader } from "../agents/manifest.ts";
 import { runTurn } from "../agents/turn-runner.ts";
 import { buildRunTurnOptsFactory, isSpawnPerTurnAgent } from "../agents/turn-runner-dispatch.ts";
@@ -22,6 +27,8 @@ import { loadConfig } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { apiJson, jsonError, jsonOutput } from "../json.ts";
 import { printError, printSuccess } from "../logging/color.ts";
+import { getConnection } from "../runtimes/connections.ts";
+import { hasNudge } from "../runtimes/headless-connection.ts";
 import { openSessionStore } from "../sessions/compat.ts";
 import type { AgentManifest, OverstoryConfig } from "../types.ts";
 import { ensureUiBuild } from "./serve/build.ts";
@@ -333,6 +340,62 @@ function tryInstallTurnRunnerLoop(
 }
 
 /**
+ * Attempt to start a persistent-capability mail loop for one agent. Returns
+ * the stop function on success, or null when the agent is not eligible —
+ * either it's not a persistent capability (coordinator/orchestrator/monitor),
+ * or no in-process headless connection is registered (tmux-mode persistent
+ * agents receive mail through `nudgeAgent` -> tmux send-keys, not stdin).
+ *
+ * This closes the mail-delivery gap for headless coordinators spawned by
+ * `ov serve` (overstory-b03a). The spawn-per-turn loop only handles
+ * task-scoped capabilities; without this fallback, mail to the coordinator
+ * lands in `mail.db` but never reaches its stdin.
+ */
+function tryInstallPersistentMailLoop(
+	agentName: string,
+	mailDbPath: string,
+	overstoryDir: string,
+): (() => void) | null {
+	const { store } = openSessionStore(overstoryDir);
+	let session: ReturnType<typeof store.getByName>;
+	try {
+		session = store.getByName(agentName);
+	} finally {
+		store.close();
+	}
+	if (!session) return null;
+	if (!isPersistentCapability(session.capability)) return null;
+
+	// Headless persistent agents have an empty tmuxSession AND a registered
+	// HeadlessClaudeConnection (set by spawnHeadlessAgent). Tmux-mode persistent
+	// agents have a non-empty tmuxSession and no registered connection — they
+	// receive mail through tmux send-keys via `ov nudge` and don't need this loop.
+	if (session.tmuxSession !== "") return null;
+
+	const conn = getConnection(agentName);
+	if (conn === undefined || !hasNudge(conn)) return null;
+
+	const isAgentLive = (): boolean => {
+		const { store: liveStore } = openSessionStore(overstoryDir);
+		try {
+			const live = liveStore.getByName(agentName);
+			if (!live) return false;
+			return live.state !== "completed" && live.state !== "zombie";
+		} finally {
+			liveStore.close();
+		}
+	};
+
+	return startPersistentMailLoop(agentName, mailDbPath, {
+		getConn: (name) => {
+			const c = getConnection(name);
+			return c !== undefined && hasNudge(c) ? c : undefined;
+		},
+		isAgentLive,
+	});
+}
+
+/**
  * Install per-agent mail injection loops driven by the spawn-per-turn engine.
  *
  * Discovers agents from SessionStore (rather than from a per-agent FIFO file
@@ -351,18 +414,21 @@ export function installMailInjectors(
 ): () => void {
 	const activeLoops = new Map<string, () => void>();
 
-	if (dispatch === undefined) {
-		// No manifest available — no spawn-per-turn dispatch possible. Return a
-		// no-op stop so callers can wire shutdown unconditionally.
-		return function noopStopMailInjectors(): void {};
-	}
-
 	const startLoopFor = (agentName: string): void => {
 		if (activeLoops.has(agentName)) return;
-		const turnLoop = tryInstallTurnRunnerLoop(agentName, mailDbPath, overstoryDir, dispatch);
-		if (turnLoop === null) return;
+		// Spawn-per-turn loop for task-scoped capabilities (builder/scout/...)
+		// only when manifest dispatch context is available.
+		const turnLoop = dispatch
+			? tryInstallTurnRunnerLoop(agentName, mailDbPath, overstoryDir, dispatch)
+			: null;
+		// Persistent-capability loop for headless coordinator/orchestrator/monitor
+		// — runs even without `dispatch` since it doesn't need the manifest.
+		const persistentLoop =
+			turnLoop === null ? tryInstallPersistentMailLoop(agentName, mailDbPath, overstoryDir) : null;
+		const loop = turnLoop ?? persistentLoop;
+		if (loop === null) return;
 		activeLoops.set(agentName, () => {
-			turnLoop();
+			loop();
 			activeLoops.delete(agentName);
 		});
 	};
@@ -373,13 +439,22 @@ export function installMailInjectors(
 
 	// Discover non-terminal agents from SessionStore. Each rescan re-checks
 	// every agent's state so loops auto-stop on completed/zombie.
+	//
+	// Errors during scan are absorbed — when the project root has been torn
+	// down (e.g. test cleanup races a still-running rescan timer), opening
+	// the session store throws SQLiteError. Letting that propagate would
+	// surface as an unhandled "between tests" error and fail unrelated tests.
 	const scan = (): void => {
-		const { store } = openSessionStore(overstoryDir);
-		let sessions: ReturnType<typeof store.getAll>;
+		let sessions: ReturnType<ReturnType<typeof openSessionStore>["store"]["getAll"]>;
 		try {
-			sessions = store.getAll();
-		} finally {
-			store.close();
+			const { store } = openSessionStore(overstoryDir);
+			try {
+				sessions = store.getAll();
+			} finally {
+				store.close();
+			}
+		} catch {
+			return;
 		}
 		const liveNames = new Set<string>();
 		for (const session of sessions) {

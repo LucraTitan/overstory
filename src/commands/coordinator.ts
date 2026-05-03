@@ -905,6 +905,25 @@ function isActivePersistentAgentSession(
 }
 
 /**
+ * Liveness check that handles both tmux and headless persistent agents.
+ *
+ * Tmux-backed sessions check the tmux server. Headless sessions
+ * (`tmuxSession === ""`) fall back to OS-level PID liveness via
+ * `isProcessRunning(session.pid)`. Without this branch, callers that asked
+ * tmux about an empty session name got `false` and incorrectly flipped a
+ * healthy headless coordinator to `zombie` (overstory-34a6).
+ */
+async function isPersistentAgentAlive(
+	session: AgentSession,
+	tmux: { isSessionAlive: (name: string) => Promise<boolean> },
+): Promise<boolean> {
+	if (session.tmuxSession === "") {
+		return session.pid !== null && isProcessRunning(session.pid);
+	}
+	return await tmux.isSessionAlive(session.tmuxSession);
+}
+
+/**
  * Stop the coordinator agent.
  *
  * 1. Find the active coordinator session
@@ -1097,11 +1116,11 @@ async function statusPersistentAgent(
 			return;
 		}
 
-		const alive = await tmux.isSessionAlive(session.tmuxSession);
+		const alive = await isPersistentAgentAlive(session, tmux);
 
-		// Reconcile state: if session says active but tmux is dead, update.
-		// We already filtered out completed/zombie states above, so if tmux is dead
-		// this session needs to be marked as zombie.
+		// Reconcile state: if session says active but the underlying process/tmux
+		// is dead, update. We already filtered out completed/zombie states above,
+		// so if it's actually dead this session needs to be marked as zombie.
 		if (!alive) {
 			store.updateState(spec.agentName, "zombie");
 			store.updateLastActivity(spec.agentName);
@@ -1177,16 +1196,17 @@ async function sendToPersistentAgent(
 			});
 		}
 
-		const alive = await tmux.isSessionAlive(session.tmuxSession);
+		const alive = await isPersistentAgentAlive(session, tmux);
 		if (!alive) {
 			store.updateState(spec.agentName, "zombie");
 			store.updateLastActivity(spec.agentName);
-			throw new AgentError(
-				`${spec.displayName} tmux session "${session.tmuxSession}" is not alive`,
-				{
-					agentName: spec.agentName,
-				},
-			);
+			const target =
+				session.tmuxSession === ""
+					? `process pid ${session.pid ?? "unknown"}`
+					: `tmux session "${session.tmuxSession}"`;
+			throw new AgentError(`${spec.displayName} ${target} is not alive`, {
+				agentName: spec.agentName,
+			});
 		}
 
 		// Send mail
@@ -1277,16 +1297,17 @@ export async function askPersistentAgent(
 			});
 		}
 
-		const alive = await tmux.isSessionAlive(session.tmuxSession);
+		const alive = await isPersistentAgentAlive(session, tmux);
 		if (!alive) {
 			store.updateState(spec.agentName, "zombie");
 			store.updateLastActivity(spec.agentName);
-			throw new AgentError(
-				`${spec.displayName} tmux session "${session.tmuxSession}" is not alive`,
-				{
-					agentName: spec.agentName,
-				},
-			);
+			const target =
+				session.tmuxSession === ""
+					? `process pid ${session.pid ?? "unknown"}`
+					: `tmux session "${session.tmuxSession}"`;
+			throw new AgentError(`${spec.displayName} ${target} is not alive`, {
+				agentName: spec.agentName,
+			});
 		}
 
 		// Generate correlation ID for tracking this request/response pair
@@ -1395,7 +1416,17 @@ async function outputPersistentAgent(
 			});
 		}
 
-		const alive = await tmux.isSessionAlive(session.tmuxSession);
+		// Headless sessions have no tmux pane to capture from. Surface a clear
+		// error instead of falling through to capture-pane on an empty session
+		// name (which would otherwise return null and confuse callers).
+		if (session.tmuxSession === "") {
+			throw new AgentError(
+				`${spec.displayName} is running headless — no tmux pane to capture. Use 'ov logs --agent ${spec.agentName}' instead.`,
+				{ agentName: spec.agentName },
+			);
+		}
+
+		const alive = await isPersistentAgentAlive(session, tmux);
 		if (!alive) {
 			store.updateState(spec.agentName, "zombie");
 			store.updateLastActivity(spec.agentName);

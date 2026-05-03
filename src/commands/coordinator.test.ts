@@ -1215,6 +1215,54 @@ describe("statusCoordinator", () => {
 		expect(parsed.state).toBe("zombie");
 	});
 
+	test("headless: reports running when pid is alive even though tmuxSession is empty (overstory-34a6)", async () => {
+		// Headless coordinator: tmuxSession === "", liveness comes from PID check.
+		// Use process.pid (test runner's own PID) as a guaranteed-alive process.
+		const session = makeCoordinatorSession({
+			state: "working",
+			tmuxSession: "",
+			pid: process.pid,
+		});
+		saveSessionsToDb([session]);
+		// sessionAliveMap is empty — tmux.isSessionAlive should NOT be consulted
+		// for headless sessions. If the regression returns, fakeTmux returns false
+		// for an unknown name and the status flips to zombie.
+		const { deps, calls } = makeDeps();
+
+		const output = await captureStdout(() => coordinatorCommand(["status", "--json"], deps));
+		const parsed = JSON.parse(output) as Record<string, unknown>;
+
+		expect(parsed.running).toBe(true);
+		expect(parsed.state).toBe("working");
+		expect(parsed.tmuxSession).toBe("");
+		// No tmux liveness check should have been made for the headless session.
+		expect(calls.isSessionAlive).toEqual([]);
+
+		// SessionStore must NOT have been flipped to zombie.
+		const sessions = loadSessionsFromDb();
+		expect(sessions[0]?.state).toBe("working");
+	});
+
+	test("headless: flips to zombie when pid is dead (sentinel non-existent PID)", async () => {
+		// PID 2147483647 (INT32_MAX) is reserved/invalid and never alive.
+		const session = makeCoordinatorSession({
+			state: "working",
+			tmuxSession: "",
+			pid: 2147483647,
+		});
+		saveSessionsToDb([session]);
+		const { deps } = makeDeps();
+
+		const output = await captureStdout(() => coordinatorCommand(["status", "--json"], deps));
+		const parsed = JSON.parse(output) as Record<string, unknown>;
+
+		expect(parsed.running).toBe(false);
+		expect(parsed.state).toBe("zombie");
+
+		const sessions = loadSessionsFromDb();
+		expect(sessions[0]?.state).toBe("zombie");
+	});
+
 	test("does not show completed sessions as active", async () => {
 		const completed = makeCoordinatorSession({ state: "completed" });
 		saveSessionsToDb([completed]);

@@ -204,10 +204,12 @@ export async function sendToCoordinator(
 			priority: "normal",
 		});
 
-		// When a headless connection is registered the mail-injection loop
-		// (installMailInjectors() in serve.ts) picks the row up automatically;
-		// no explicit followUp() is required. We intentionally do not duplicate
-		// the followUp here to keep delivery semantics single-sourced.
+		// Headless coordinator: `installMailInjectors` (serve.ts) runs a
+		// per-agent persistent mail loop that polls `mail.db` and writes the
+		// batch to the live `HeadlessClaudeConnection.followUp()` (overstory-b03a).
+		// We intentionally do not call followUp() inline here to keep delivery
+		// single-sourced — the loop handles batching, marking-read, and retry.
+		// Tmux coordinators are excluded above (ConflictError).
 		return { messageId };
 	} finally {
 		stores.close();

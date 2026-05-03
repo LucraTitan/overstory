@@ -6,8 +6,10 @@ import { createMailClient } from "../mail/client.ts";
 import { createMailStore } from "../mail/store.ts";
 import type { MailMessage } from "../types.ts";
 import {
+	_runPersistentMailTick,
 	_runTurnRunnerTick,
 	formatMailBatch,
+	startPersistentMailLoop,
 	startTurnRunnerMailLoop,
 	type TurnRunnerOptsFactory,
 } from "./headless-mail-injector.ts";
@@ -444,5 +446,264 @@ describe("startTurnRunnerMailLoop", () => {
 		// only message already marked read). Allow ≤2 to keep the assertion
 		// resilient to scheduler timing on slower CI runners.
 		expect(calls).toBeLessThanOrEqual(2);
+	});
+});
+
+describe("startPersistentMailLoop", () => {
+	let tempDir: string;
+	let mailDbPath: string;
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "overstory-persistent-mail-test-"));
+		mailDbPath = join(tempDir, "mail.db");
+	});
+
+	afterEach(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	function makeFakeConn(): {
+		conn: { followUp(text: string): Promise<void> };
+		writes: string[];
+		failNext?: () => void;
+	} {
+		const writes: string[] = [];
+		let nextFailure: Error | null = null;
+		return {
+			writes,
+			conn: {
+				async followUp(text: string): Promise<void> {
+					if (nextFailure !== null) {
+						const err = nextFailure;
+						nextFailure = null;
+						throw err;
+					}
+					writes.push(text);
+				},
+			},
+			failNext: () => {
+				nextFailure = new Error("simulated stdin write failure");
+			},
+		};
+	}
+
+	test("writes batched user turn to followUp and marks messages read", async () => {
+		const store = createMailStore(mailDbPath);
+		const client = createMailClient(store);
+		client.send({
+			from: "lead-1",
+			to: "coordinator",
+			subject: "merge_ready",
+			body: "branch ready",
+			type: "merge_ready",
+			priority: "normal",
+		});
+		client.send({
+			from: "operator",
+			to: "coordinator",
+			subject: "check in",
+			body: "status please",
+			type: "dispatch",
+			priority: "normal",
+		});
+		store.close();
+
+		const fake = makeFakeConn();
+		const result = await _runPersistentMailTick("coordinator", mailDbPath, {
+			getConn: () => fake.conn,
+		});
+
+		expect(result.kind).toBe("delivered");
+		expect(fake.writes.length).toBe(1);
+		const ndjson = fake.writes[0]?.trimEnd() ?? "";
+		const parsed = JSON.parse(ndjson);
+		expect(parsed.type).toBe("user");
+		const text: string = parsed.message.content[0].text;
+		expect(text).toContain("merge_ready");
+		expect(text).toContain("check in");
+
+		const checkStore = createMailStore(mailDbPath);
+		try {
+			expect(checkStore.getUnread("coordinator").length).toBe(0);
+		} finally {
+			checkStore.close();
+		}
+	});
+
+	test("idle when no unread mail: does not invoke followUp", async () => {
+		const fake = makeFakeConn();
+		const result = await _runPersistentMailTick("coordinator", mailDbPath, {
+			getConn: () => fake.conn,
+		});
+
+		expect(result.kind).toBe("idle");
+		expect(fake.writes.length).toBe(0);
+	});
+
+	test("no-connection short-circuits delivery (mail stays unread)", async () => {
+		const store = createMailStore(mailDbPath);
+		const client = createMailClient(store);
+		client.send({
+			from: "operator",
+			to: "coordinator",
+			subject: "hi",
+			body: "x",
+			type: "dispatch",
+			priority: "normal",
+		});
+		store.close();
+
+		const result = await _runPersistentMailTick("coordinator", mailDbPath, {
+			getConn: () => undefined,
+		});
+
+		expect(result.kind).toBe("no-connection");
+
+		const checkStore = createMailStore(mailDbPath);
+		try {
+			expect(checkStore.getUnread("coordinator").length).toBe(1);
+		} finally {
+			checkStore.close();
+		}
+	});
+
+	test("agent-stopped predicate short-circuits before reading mail", async () => {
+		const store = createMailStore(mailDbPath);
+		const client = createMailClient(store);
+		client.send({
+			from: "operator",
+			to: "coordinator",
+			subject: "hi",
+			body: "x",
+			type: "dispatch",
+			priority: "normal",
+		});
+		store.close();
+
+		const fake = makeFakeConn();
+		const result = await _runPersistentMailTick("coordinator", mailDbPath, {
+			getConn: () => fake.conn,
+			isAgentLive: () => false,
+		});
+
+		expect(result.kind).toBe("agent-stopped");
+		expect(fake.writes.length).toBe(0);
+
+		const checkStore = createMailStore(mailDbPath);
+		try {
+			expect(checkStore.getUnread("coordinator").length).toBe(1);
+		} finally {
+			checkStore.close();
+		}
+	});
+
+	test("loop returns a stop function that prevents further followUp invocations", async () => {
+		const store = createMailStore(mailDbPath);
+		const client = createMailClient(store);
+		client.send({
+			from: "operator",
+			to: "coordinator",
+			subject: "first",
+			body: "first body",
+			type: "dispatch",
+			priority: "normal",
+		});
+		store.close();
+
+		const fake = makeFakeConn();
+		const stop = startPersistentMailLoop("coordinator", mailDbPath, {
+			getConn: () => fake.conn,
+			intervalMs: 30,
+		});
+
+		// Wait for a tick to fire and deliver
+		await new Promise((r) => setTimeout(r, 100));
+		stop();
+
+		const writeCountBeforeNewMail = fake.writes.length;
+		expect(writeCountBeforeNewMail).toBeGreaterThanOrEqual(1);
+
+		// Send new mail after stop — must not be delivered
+		const store2 = createMailStore(mailDbPath);
+		const client2 = createMailClient(store2);
+		client2.send({
+			from: "operator",
+			to: "coordinator",
+			subject: "after-stop",
+			body: "should not be delivered",
+			type: "dispatch",
+			priority: "normal",
+		});
+		store2.close();
+
+		await new Promise((r) => setTimeout(r, 100));
+		expect(fake.writes.length).toBe(writeCountBeforeNewMail);
+	});
+
+	test("isAgentLive=false self-stops the loop", async () => {
+		const store = createMailStore(mailDbPath);
+		const client = createMailClient(store);
+		client.send({
+			from: "operator",
+			to: "coordinator",
+			subject: "hi",
+			body: "x",
+			type: "dispatch",
+			priority: "normal",
+		});
+		store.close();
+
+		const fake = makeFakeConn();
+		let alive = true;
+		const stop = startPersistentMailLoop("coordinator", mailDbPath, {
+			getConn: () => fake.conn,
+			isAgentLive: () => alive,
+			intervalMs: 30,
+		});
+
+		alive = false;
+		// Wait long enough for several ticks — none should deliver since
+		// isAgentLive returns false on the very first tick.
+		await new Promise((r) => setTimeout(r, 150));
+		stop();
+
+		expect(fake.writes.length).toBe(0);
+
+		const checkStore = createMailStore(mailDbPath);
+		try {
+			expect(checkStore.getUnread("coordinator").length).toBe(1);
+		} finally {
+			checkStore.close();
+		}
+	});
+
+	test("write failure leaves messages unread for retry", async () => {
+		const store = createMailStore(mailDbPath);
+		const client = createMailClient(store);
+		client.send({
+			from: "operator",
+			to: "coordinator",
+			subject: "retry-me",
+			body: "x",
+			type: "dispatch",
+			priority: "normal",
+		});
+		store.close();
+
+		const fake = makeFakeConn();
+		fake.failNext?.();
+
+		const result = await _runPersistentMailTick("coordinator", mailDbPath, {
+			getConn: () => fake.conn,
+		});
+
+		expect(result.kind).toBe("error");
+
+		const checkStore = createMailStore(mailDbPath);
+		try {
+			expect(checkStore.getUnread("coordinator").length).toBe(1);
+		} finally {
+			checkStore.close();
+		}
 	});
 });

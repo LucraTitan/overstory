@@ -181,6 +181,164 @@ export function startTurnRunnerMailLoop(
 }
 
 /**
+ * Mail dispatcher for persistent headless agents (coordinator/orchestrator/monitor).
+ *
+ * Persistent capabilities run as a single long-lived claude process — unlike
+ * task-scoped workers, there is no spawn-per-turn engine to reach them. Mail
+ * delivery instead writes directly to the live process's stdin via the
+ * registered HeadlessClaudeConnection. Without this loop, mail sent to a
+ * headless coordinator (e.g. operator messages from `ov serve`'s UI, worker
+ * `worker_done`/`merge_ready` mails) lands in `mail.db` but is never seen by
+ * the agent — `installMailInjectors`'s spawn-per-turn loop filters out
+ * persistent capabilities (overstory-b03a).
+ *
+ * The loop polls every `intervalMs` ms. Each tick:
+ *   1. Resolve the live `RuntimeConnection` via `getConn(agentName)`. If the
+ *      connection has been removed (agent stopped), self-terminate.
+ *   2. If `isAgentLive()` reports terminal state, self-terminate.
+ *   3. Read unread mail for the agent. If empty, return idle.
+ *   4. Format the batch as a stream-json user turn, write to the connection
+ *      via `followUp()`, then mark messages read.
+ *
+ * The write is best-effort: Claude Code may not pick up stdin until the
+ * current model turn finishes (see `HeadlessClaudeConnection.nudge` notes),
+ * but the data sits in the pipe buffer and gets consumed at the next turn
+ * boundary. Marking-read happens unconditionally after a successful write —
+ * the agent processes batches in arrival order and we do not want to keep
+ * re-injecting the same messages on every tick.
+ */
+export interface PersistentMailLoopDeps {
+	/** Resolve the live connection (returns undefined when none registered). */
+	getConn: (agentName: string) => { followUp(text: string): Promise<void> } | undefined;
+	/** Optional liveness predicate; when false, the loop stops itself. */
+	isAgentLive?: () => boolean;
+	/** Poll interval in ms. Default: 2000. */
+	intervalMs?: number;
+}
+
+export type PersistentMailTickResult =
+	| { kind: "idle" }
+	| { kind: "no-connection" }
+	| { kind: "agent-stopped" }
+	| { kind: "delivered"; messageIds: string[] }
+	| { kind: "error"; error: unknown; messageIds: string[] };
+
+/**
+ * Start the persistent-mail dispatcher for one agent. Returns the stop function.
+ * The caller owns the connection lifecycle — when the agent terminates, the
+ * caller is responsible for invoking the returned stop function (or letting
+ * the `isAgentLive` predicate self-terminate the loop).
+ */
+export function startPersistentMailLoop(
+	agentName: string,
+	mailStorePath: string,
+	deps: PersistentMailLoopDeps,
+): () => void {
+	let stopped = false;
+	let inFlight = false;
+	let timer: ReturnType<typeof setInterval> | null = null;
+	const intervalMs = deps.intervalMs ?? 2000;
+
+	const stop = (): void => {
+		stopped = true;
+		if (timer !== null) {
+			clearInterval(timer);
+			timer = null;
+		}
+	};
+
+	const tick = async (): Promise<PersistentMailTickResult> => {
+		if (stopped) return { kind: "idle" };
+		if (inFlight) return { kind: "idle" };
+		if (deps.isAgentLive && !deps.isAgentLive()) {
+			stop();
+			return { kind: "agent-stopped" };
+		}
+		const conn = deps.getConn(agentName);
+		if (conn === undefined) {
+			// Connection dropped — caller will reap us via session rescan, but
+			// short-circuit until then so we don't spin reading mail we can't
+			// deliver.
+			return { kind: "no-connection" };
+		}
+
+		const store = createMailStore(mailStorePath);
+		let messages: ReturnType<typeof store.getUnread>;
+		try {
+			messages = store.getUnread(agentName);
+		} finally {
+			store.close();
+		}
+		if (messages.length === 0) return { kind: "idle" };
+
+		const userTurn = encodeUserTurn(formatMailBatch(messages));
+		const ids = messages.map((m) => m.id);
+
+		inFlight = true;
+		try {
+			await conn.followUp(userTurn);
+			const markStore = createMailStore(mailStorePath);
+			try {
+				for (const id of ids) markStore.markRead(id);
+			} finally {
+				markStore.close();
+			}
+			return { kind: "delivered", messageIds: ids };
+		} catch (error) {
+			return { kind: "error", error, messageIds: ids };
+		} finally {
+			inFlight = false;
+		}
+	};
+
+	timer = setInterval(() => {
+		tick().catch(() => {});
+	}, intervalMs);
+
+	return stop;
+}
+
+/**
+ * Internal: single-tick variant of `startPersistentMailLoop` for deterministic tests.
+ */
+export async function _runPersistentMailTick(
+	agentName: string,
+	mailStorePath: string,
+	deps: PersistentMailLoopDeps,
+): Promise<PersistentMailTickResult> {
+	if (deps.isAgentLive && !deps.isAgentLive()) {
+		return { kind: "agent-stopped" };
+	}
+	const conn = deps.getConn(agentName);
+	if (conn === undefined) return { kind: "no-connection" };
+
+	const store = createMailStore(mailStorePath);
+	let messages: ReturnType<typeof store.getUnread>;
+	try {
+		messages = store.getUnread(agentName);
+	} finally {
+		store.close();
+	}
+	if (messages.length === 0) return { kind: "idle" };
+
+	const userTurn = encodeUserTurn(formatMailBatch(messages));
+	const ids = messages.map((m) => m.id);
+
+	try {
+		await conn.followUp(userTurn);
+		const markStore = createMailStore(mailStorePath);
+		try {
+			for (const id of ids) markStore.markRead(id);
+		} finally {
+			markStore.close();
+		}
+		return { kind: "delivered", messageIds: ids };
+	} catch (error) {
+		return { kind: "error", error, messageIds: ids };
+	}
+}
+
+/**
  * Internal: run a single dispatcher tick. Exported for tests so they can
  * drive the loop deterministically without setInterval timing.
  */
