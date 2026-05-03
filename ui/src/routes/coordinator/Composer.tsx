@@ -1,4 +1,13 @@
-import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+	type KeyboardEvent,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
+import { createPortal } from "react-dom";
 
 import { Button } from "@/components/ui/button";
 
@@ -39,6 +48,12 @@ function matchSlashEntries(value: string): SlashEntry[] {
 	return SLASH_ENTRIES.filter((e) => e.cmd.startsWith(trimmed));
 }
 
+interface MenuPosition {
+	left: number;
+	bottom: number;
+	width: number;
+}
+
 export function Composer({
 	value,
 	onChange,
@@ -50,18 +65,53 @@ export function Composer({
 }: ComposerProps) {
 	const taRef = useRef<HTMLTextAreaElement>(null);
 	const containerRef = useRef<HTMLDivElement>(null);
+	const anchorRef = useRef<HTMLDivElement>(null);
+	const menuRef = useRef<HTMLDivElement>(null);
 	const [askArmed, setAskArmed] = useState<{ subject: string } | null>(null);
 	const [dismissed, setDismissed] = useState(false);
+	const [menuPosition, setMenuPosition] = useState<MenuPosition | null>(null);
 
 	const showSlashMenu = useMemo(() => isSlashOnly(value) && !dismissed, [value, dismissed]);
 	const slashEntries = useMemo(() => matchSlashEntries(value), [value]);
 
+	const measure = useCallback(() => {
+		const anchor = anchorRef.current;
+		if (!anchor) return;
+		const rect = anchor.getBoundingClientRect();
+		// Match the previous `left-6 right-6` inset.
+		const inset = 24;
+		setMenuPosition({
+			left: rect.left + inset,
+			bottom: window.innerHeight - rect.top + 8,
+			width: Math.max(0, rect.width - inset * 2),
+		});
+	}, []);
+
+	useLayoutEffect(() => {
+		if (!showSlashMenu) return;
+		measure();
+	}, [showSlashMenu, measure]);
+
+	useEffect(() => {
+		if (!showSlashMenu) return;
+		function onResizeOrScroll() {
+			measure();
+		}
+		window.addEventListener("resize", onResizeOrScroll);
+		window.addEventListener("scroll", onResizeOrScroll, true);
+		return () => {
+			window.removeEventListener("resize", onResizeOrScroll);
+			window.removeEventListener("scroll", onResizeOrScroll, true);
+		};
+	}, [showSlashMenu, measure]);
+
 	useEffect(() => {
 		if (!showSlashMenu) return;
 		function handleMouseDown(e: MouseEvent) {
-			if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
-				setDismissed(true);
-			}
+			const target = e.target as Node;
+			if (containerRef.current?.contains(target)) return;
+			if (menuRef.current?.contains(target)) return;
+			setDismissed(true);
 		}
 		document.addEventListener("mousedown", handleMouseDown);
 		return () => document.removeEventListener("mousedown", handleMouseDown);
@@ -165,23 +215,10 @@ export function Composer({
 					</button>
 				</div>
 			)}
-			<div className="relative px-6 py-4 flex items-end gap-3 max-w-4xl mx-auto w-full">
-				{showSlashMenu && slashEntries.length > 0 && (
-					<div className="absolute left-6 right-6 bottom-full mb-2 border border-border rounded-lg bg-popover shadow-md text-sm z-10 overflow-hidden">
-						{slashEntries.map((e) => (
-							<button
-								key={e.cmd}
-								type="button"
-								className="w-full text-left px-4 py-2.5 hover:bg-accent flex items-baseline gap-3 transition-colors"
-								onMouseDown={(ev) => ev.preventDefault()}
-								onClick={() => handleSelectSlash(e)}
-							>
-								<span className="font-mono text-xs">{e.cmd}</span>
-								<span className="text-xs text-muted-foreground">{e.hint}</span>
-							</button>
-						))}
-					</div>
-				)}
+			<div
+				ref={anchorRef}
+				className="relative px-6 py-4 flex items-end gap-3 max-w-4xl mx-auto w-full"
+			>
 				<textarea
 					ref={taRef}
 					value={value}
@@ -204,6 +241,39 @@ export function Composer({
 					{isPending ? "Stop" : askArmed !== null ? "Ask" : "Send"}
 				</Button>
 			</div>
+			{showSlashMenu &&
+				slashEntries.length > 0 &&
+				menuPosition !== null &&
+				createPortal(
+					<div
+						ref={menuRef}
+						role="listbox"
+						aria-label="Slash commands"
+						style={{
+							position: "fixed",
+							left: menuPosition.left,
+							bottom: menuPosition.bottom,
+							width: menuPosition.width,
+						}}
+						className="z-50 border border-border rounded-lg bg-popover shadow-md text-sm overflow-hidden"
+					>
+						{slashEntries.map((e) => (
+							<button
+								key={e.cmd}
+								type="button"
+								role="option"
+								aria-selected="false"
+								className="w-full text-left px-4 py-2.5 hover:bg-accent flex items-baseline gap-3 transition-colors"
+								onMouseDown={(ev) => ev.preventDefault()}
+								onClick={() => handleSelectSlash(e)}
+							>
+								<span className="font-mono text-xs">{e.cmd}</span>
+								<span className="text-xs text-muted-foreground">{e.hint}</span>
+							</button>
+						))}
+					</div>,
+					document.body,
+				)}
 		</div>
 	);
 }
