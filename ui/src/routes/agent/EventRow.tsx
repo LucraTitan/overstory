@@ -84,10 +84,15 @@ function ToolUseRow({ event }: { event: StoredEvent }) {
 	return (
 		<Card className="py-3 gap-2">
 			<CardHeader className="px-4 pb-0 pt-0">
-				<div className="flex items-center gap-2">
-					<Badge variant="secondary">tool</Badge>
+				<div className="flex items-start gap-2">
+					<Badge variant="secondary" className="self-start">
+						tool
+					</Badge>
 					<CardTitle className="text-xs font-mono font-normal truncate">{summary}</CardTitle>
-					<span className="ml-auto text-xs text-muted-foreground shrink-0">
+					<span
+						className="ml-auto text-xs text-muted-foreground shrink-0 self-start"
+						title={event.createdAt}
+					>
 						{formatTs(event.createdAt)}
 					</span>
 				</div>
@@ -103,15 +108,19 @@ function ToolResultRow({ event }: { event: StoredEvent }) {
 		<Collapsible>
 			<Card className="py-3 gap-2">
 				<CardHeader className="px-4 pb-0 pt-0">
-					<div className="flex items-center gap-2">
-						<Badge variant="outline">result</Badge>
-						<span className="text-xs text-muted-foreground font-mono">{label}</span>
-						<CollapsibleTrigger className="ml-auto" />
+					<div className="flex items-start gap-2">
+						<Badge variant="outline" className="self-start">
+							result
+						</Badge>
+						<span className="text-xs text-muted-foreground font-mono" title={event.createdAt}>
+							{label}
+						</span>
+						<CollapsibleTrigger className="ml-auto self-start" aria-label="Toggle tool output" />
 					</div>
 				</CardHeader>
 				{event.data && (
 					<CollapsibleContent>
-						<CardContent className="px-4 pt-2">
+						<CardContent className="px-4 pt-0">
 							<CodeBlock variant="block">{event.data}</CodeBlock>
 						</CardContent>
 					</CollapsibleContent>
@@ -127,15 +136,20 @@ function AssistantMessageRow({ event }: { event: StoredEvent }) {
 	return (
 		<Card className="py-3 gap-2">
 			<CardHeader className="px-4 pb-0 pt-0">
-				<div className="flex items-center gap-2">
-					<Badge variant="outline">msg</Badge>
-					<span className="ml-auto text-xs text-muted-foreground shrink-0">
+				<div className="flex items-start gap-2">
+					<Badge variant="outline" className="self-start">
+						msg
+					</Badge>
+					<span
+						className="ml-auto text-xs text-muted-foreground shrink-0 self-start"
+						title={event.createdAt}
+					>
 						{formatTs(event.createdAt)}
 					</span>
 				</div>
 			</CardHeader>
-			<CardContent className="px-4 pt-1">
-				<p className="text-sm whitespace-pre-wrap">{text}</p>
+			<CardContent className="px-4 pt-0">
+				<p className="text-sm whitespace-pre-wrap border-l-2 border-border pl-3">{text}</p>
 			</CardContent>
 		</Card>
 	);
@@ -146,15 +160,22 @@ function ErrorRow({ event }: { event: StoredEvent }) {
 	return (
 		<Card className="py-3 gap-2 border-destructive/60">
 			<CardHeader className="px-4 pb-0 pt-0">
-				<div className="flex items-center gap-2">
-					<Badge variant="destructive">error</Badge>
-					<span className="ml-auto text-xs text-muted-foreground shrink-0">
+				<div className="flex items-start gap-2">
+					<Badge variant="destructive" className="self-start">
+						error
+					</Badge>
+					<span
+						className="ml-auto text-xs text-muted-foreground shrink-0 self-start"
+						title={event.createdAt}
+					>
 						{formatTs(event.createdAt)}
 					</span>
 				</div>
 			</CardHeader>
-			<CardContent className="px-4 pt-1">
-				<p className="text-sm text-destructive whitespace-pre-wrap">{body}</p>
+			<CardContent className="px-4 pt-0">
+				<p className="text-sm text-destructive whitespace-pre-wrap border-l-2 border-destructive/60 pl-3">
+					{body}
+				</p>
 			</CardContent>
 		</Card>
 	);
@@ -164,12 +185,17 @@ function GenericRow({ event }: { event: StoredEvent }) {
 	return (
 		<Card className="py-3 gap-2">
 			<CardHeader className="px-4 pb-0 pt-0">
-				<div className="flex items-center gap-2">
-					<Badge variant="outline">{event.eventType}</Badge>
-					<Badge variant="secondary" className="text-xs">
+				<div className="flex items-start gap-2">
+					<Badge variant="outline" className="self-start">
+						{event.eventType}
+					</Badge>
+					<Badge variant="secondary" className="text-xs self-start">
 						{event.level}
 					</Badge>
-					<span className="ml-auto text-xs text-muted-foreground shrink-0">
+					<span
+						className="ml-auto text-xs text-muted-foreground shrink-0 self-start"
+						title={event.createdAt}
+					>
 						{formatTs(event.createdAt)}
 					</span>
 				</div>
