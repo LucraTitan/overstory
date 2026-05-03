@@ -320,6 +320,31 @@ this are misaligned, not bypassing a security boundary.
 For future work, Option B (MCP proxy) is the right path to mechanical enforcement
 without OS sandboxing.
 
+> **Note (2026-05-01): Option C now exists for Claude.** Anthropic shipped
+> [`@anthropic-ai/sandbox-runtime`](https://github.com/anthropic-experimental/sandbox-runtime)
+> (`srt`), a per-process OS sandbox: `sandbox-exec`/Seatbelt on macOS,
+> `bubblewrap` on Linux, plus proxy-mediated network allowlists. It exposes both
+> a CLI wrapper (`srt <cmd>`) and a TypeScript library
+> (`SandboxManager.wrapWithSandbox()`), so it slots cleanly under
+> `Bun.spawn` at the runtime-adapter layer — no container required. This is
+> exactly the "not available for Claude Code CLI today" gap from Option C above,
+> and it would close the Codex-vs-Claude security parity gap noted earlier in
+> this section. Adoption shape: wrap `buildDirectSpawn` argv per runtime, generate
+> a per-agent policy file alongside the CLAUDE.md overlay
+> (`allowWrite: [worktree, .overstory/, .mulch/, .seeds/, .canopy/]`,
+> network allowlist for Anthropic API + npm + GitHub), and demote PreToolUse
+> path-boundary / bash-danger guards to belt-and-suspenders. Caveats: it's a
+> beta research preview (pin versions, isolate behind the adapter); policy
+> design is real work (every shell-out target must be in `allowWrite`); the
+> network proxy lifecycle wants one shared instance per swarm, not per agent;
+> doesn't help Copilot's `~/.config/github-copilot/config.json` mutation
+> (XDG re-route still needed); `~/.claude/projects/` must remain writable for
+> transcripts. Cross-cuts `docs/design/containerize-swarms.md` — once agents
+> are OS-sandboxed, container-per-swarm becomes a deployment/reproducibility
+> shape, not a load-bearing isolation requirement, which materially changes
+> the Phase-2 framing in that doc. Track as a follow-up before Phase 2 of
+> containerization starts.
+
 ### Implication for `deployConfig` in headless mode
 
 > **Superseded by overstory-e24b.** The original guidance below ("skip hooks
