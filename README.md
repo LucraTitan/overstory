@@ -6,11 +6,11 @@ Multi-agent orchestration for AI coding agents.
 [![CI](https://github.com/jayminwest/overstory/actions/workflows/ci.yml/badge.svg)](https://github.com/jayminwest/overstory/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+> **Maintenance status.** Overstory is in maintenance mode: bug fixes and small PRs only, reviewed in roughly 2-week batches. PRs inactive for 30+ days are closed (reopen anytime). For features larger than ~200 lines, open an issue or discussion first. Active development has moved to **[Warren](https://github.com/jayminwest/warren)**, a self-hostable control plane for sandboxed cloud agents that I expect to grow into overstory's successor. If you're starting something new, look at warren first. See [CONTRIBUTING.md](CONTRIBUTING.md#review-cadence).
+
 Overstory turns a single coding session into a multi-agent team by spawning worker agents in isolated git worktrees, coordinating them through a custom SQLite mail system, and merging their work back with tiered conflict resolution. New projects spawn Claude agents headless and surface them through a web UI (`ov serve`); `tmux attach` is the opt-in escape hatch for live steering. A pluggable `AgentRuntime` interface lets you swap between 11 runtimes — Claude Code, [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Aider](https://aider.chat), [Goose](https://github.com/block/goose), [Amp](https://amp.dev), or your own adapter.
 
 > **Warning: Agent swarms are not a universal solution.** Do not deploy Overstory without understanding the risks of multi-agent orchestration — compounding error rates, cost amplification, debugging complexity, and merge conflicts are the normal case, not edge cases. Read [STEELMAN.md](STEELMAN.md) for a full risk analysis and the [Agentic Engineering Book](https://github.com/jayminwest/agentic-engineering-book) ([web version](https://jayminwest.com/agentic-engineering-book)) before using this tool in production.
-
-> **Maintenance status.** Overstory is in maintenance mode: bug fixes and small PRs only, reviewed in roughly 2-week batches. PRs inactive for 30+ days are closed (reopen anytime). For features larger than ~200 lines, open an issue or discussion first. Active development has moved to **[Warren](https://github.com/jayminwest/warren)**, a self-hostable control plane for sandboxed cloud agents that I expect to grow into overstory's successor. If you're starting something new, look at warren first. See [CONTRIBUTING.md](CONTRIBUTING.md#review-cadence).
 
 ## Install
 
