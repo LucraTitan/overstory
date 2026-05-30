@@ -20,7 +20,7 @@ quality 0–1 · ✓=CRIT-gate pass · ✗=DQ (missed a CRITICAL item).
 |---|---|---|---|---|---|
 | builder-hard  | 1.000 ✓ | 1.000 ✓ | 1.000 ✓ | 1.000 ✓ | STILL saturated — builder is genuinely cheap-routable when a test oracle exists |
 | reviewer-hard | 0.625 ✓ | 0.625 ✓ | 0.625 ✗ | 0.750 ✗ | race/UTF-8 traps separate the field; only agy+gemini stay CRIT-clean |
-| merger-hard   | 1.000 ✓ | 0.000 ✗ | 1.000 ✓ | 1.000 ✓ | pytest oracle (8 tests): gemini/glm/kimi all nail semantic merge 8/8; **only agy fails** (9 markers left, import error) |
+| merger-hard   | 1.000 ✓ | INVALID | 1.000 ✓ | 1.000 ✓ | gemini/glm/kimi all 8/8 semantic merge; **agy INVALID — async post-score mutation race** (re-run under settle+snapshot harness) |
 
 ## Per-capability read (Batch 1)
 | Capability | Best-fit candidate | Notes | Confidence |
