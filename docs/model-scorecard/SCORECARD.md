@@ -20,7 +20,7 @@ quality 0–1 · ✓=CRIT-gate pass · ✗=DQ (missed a CRITICAL item).
 |---|---|---|---|---|---|
 | builder-hard  | 1.000 ✓ | 1.000 ✓ | 1.000 ✓ | 1.000 ✓ | STILL saturated — builder is genuinely cheap-routable when a test oracle exists |
 | reviewer-hard | 0.625 ✓ | 0.625 ✓ | 0.625 ✗ | 0.750 ✗ | race/UTF-8 traps separate the field; only agy+gemini stay CRIT-clean |
-| merger-hard   | pending | pending | pending | pending | self-contained pytest oracle; next cycle |
+| merger-hard   | 1.000 ✓ | 0.000 ✗ | 1.000 ✓ | 1.000 ✓ | pytest oracle (8 tests): gemini/glm/kimi all nail semantic merge 8/8; **only agy fails** (9 markers left, import error) |
 
 ## Per-capability read (Batch 1)
 | Capability | Best-fit candidate | Notes | Confidence |
@@ -28,13 +28,18 @@ quality 0–1 · ✓=CRIT-gate pass · ✗=DQ (missed a CRITICAL item).
 | **scout**   | gemini-3-flash-preview | ties bar at 0.875, cheapest, stable | MEDIUM |
 | **builder** | gemini-3-flash-preview | saturated even on hard fixture — any cheap model works w/ test oracle | MEDIUM (hard-confirmed) |
 | **reviewer**| gemini-3-flash-preview | only cheap model CRIT-clean on BOTH easy+hard; agy clean-easy but DQ-easy-rerun, kimi/glm DQ-hard | LOW-MED |
-| **merger**  | gemini / glm / kimi | clean semantic merges; **agy unfit (leaves conflict markers)** | LOW |
+| **merger**  | gemini-3-flash-preview / glm-5.1 / kimi-k2.6 | all 8/8 on HARD semantic merge; **only agy unfit (leaves conflict markers, import error)** | MEDIUM (hard-confirmed) |
 | **monitor** | agy | only stable cheap model at 0.800; gemini 0.600, glm noisy | LOW-MED (noisy) |
 
 ## Cross-cutting findings
 - **gemini-3-flash-preview = most stable cheap model** — CRIT-clean across the widest set, ~free.
 - **agy: high raw capability, poor output hygiene** — leaks `file:///` paths, conflict markers,
-  tool-narration. Strong at monitor/reasoning; weak where exact output contract matters (merger).
+  tool-narration. Strong at monitor/reasoning; **unfit for merger on BOTH easy+hard** (only model
+  to leave conflict markers; merger-hard import error).
+- **merger discriminates by output-contract discipline, not reasoning** — gemini/glm/kimi all
+  produce valid 8/8 semantic merges on the hard fixture; agy alone botches the edit mechanics.
+- **gemini-3-flash-preview = strongest cheap all-rounder** — CRIT-clean reviewer-hard, 8/8
+  merger-hard, saturates builder, ~free.
 - **Test-oracle tasks (builder) saturate** — cheap models match Claude; route cheap with confidence.
 - **Judgment tasks (reviewer/monitor) discriminate** — need hard fixtures + n=3 to route safely.
 - **opencode-go (glm/kimi) intermittently CRIT-fails** under n=3 — variance risk; needs retry policy.
