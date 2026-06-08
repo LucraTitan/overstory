@@ -30,7 +30,9 @@ describe("ClaudeRuntime", () => {
 				env: {},
 			};
 			const cmd = runtime.buildSpawnCommand(opts);
-			expect(cmd).toBe("claude --model sonnet --permission-mode bypassPermissions");
+			expect(cmd).toBe(
+				"claude --model sonnet --permission-mode bypassPermissions --setting-sources project,local",
+			);
 		});
 
 		test("basic command with ask permission mode", () => {
@@ -41,7 +43,9 @@ describe("ClaudeRuntime", () => {
 				env: {},
 			};
 			const cmd = runtime.buildSpawnCommand(opts);
-			expect(cmd).toBe("claude --model opus --permission-mode default");
+			expect(cmd).toBe(
+				"claude --model opus --permission-mode default --setting-sources project,local",
+			);
 		});
 
 		test("with appendSystemPrompt (no quotes in prompt)", () => {
@@ -54,7 +58,7 @@ describe("ClaudeRuntime", () => {
 			};
 			const cmd = runtime.buildSpawnCommand(opts);
 			expect(cmd).toBe(
-				"claude --model sonnet --permission-mode bypassPermissions --append-system-prompt 'You are a builder agent.'",
+				"claude --model sonnet --permission-mode bypassPermissions --setting-sources project,local --append-system-prompt 'You are a builder agent.'",
 			);
 		});
 
@@ -70,7 +74,7 @@ describe("ClaudeRuntime", () => {
 			// POSIX single-quote escape: end quote, backslash-quote, start quote → '\\''
 			expect(cmd).toContain("--append-system-prompt");
 			expect(cmd).toBe(
-				"claude --model sonnet --permission-mode bypassPermissions --append-system-prompt 'Don'\\''t touch the user'\\''s files'",
+				"claude --model sonnet --permission-mode bypassPermissions --setting-sources project,local --append-system-prompt 'Don'\\''t touch the user'\\''s files'",
 			);
 		});
 
@@ -84,7 +88,7 @@ describe("ClaudeRuntime", () => {
 			};
 			const cmd = runtime.buildSpawnCommand(opts);
 			expect(cmd).toBe(
-				`claude --model opus --permission-mode bypassPermissions --append-system-prompt "$(cat '/project/.overstory/agent-defs/coordinator.md')"`,
+				`claude --model opus --permission-mode bypassPermissions --setting-sources project,local --append-system-prompt "$(cat '/project/.overstory/agent-defs/coordinator.md')"`,
 			);
 		});
 
@@ -181,12 +185,28 @@ describe("ClaudeRuntime", () => {
 	describe("buildPrintCommand", () => {
 		test("basic command without model", () => {
 			const argv = runtime.buildPrintCommand("Summarize this diff");
-			expect(argv).toEqual(["claude", "--print", "-p", "Summarize this diff"]);
+			expect(argv).toEqual([
+				"claude",
+				"--print",
+				"--setting-sources",
+				"project,local",
+				"-p",
+				"Summarize this diff",
+			]);
 		});
 
 		test("command with model override", () => {
 			const argv = runtime.buildPrintCommand("Classify this error", "haiku");
-			expect(argv).toEqual(["claude", "--print", "-p", "Classify this error", "--model", "haiku"]);
+			expect(argv).toEqual([
+				"claude",
+				"--print",
+				"--setting-sources",
+				"project,local",
+				"-p",
+				"Classify this error",
+				"--model",
+				"haiku",
+			]);
 		});
 
 		test("model undefined omits --model flag", () => {
@@ -604,8 +624,10 @@ describe("ClaudeRuntime integration: spawn command matches pre-refactor behavior
 			cwd: "/project/.overstory/worktrees/builder-1",
 			env: { OVERSTORY_AGENT_NAME: "builder-1" },
 		});
-		// Pre-refactor: `claude --model ${model} --permission-mode bypassPermissions`
-		expect(cmd).toBe("claude --model sonnet --permission-mode bypassPermissions");
+		// ISS-11: --setting-sources project,local now included for worker config isolation
+		expect(cmd).toBe(
+			"claude --model sonnet --permission-mode bypassPermissions --setting-sources project,local",
+		);
 	});
 
 	test("coordinator-style spawn: bypass mode with appendSystemPrompt", () => {
@@ -617,9 +639,9 @@ describe("ClaudeRuntime integration: spawn command matches pre-refactor behavior
 			appendSystemPrompt: baseDefinition,
 			env: { OVERSTORY_AGENT_NAME: "coordinator" },
 		});
-		// Pre-refactor: `claude --model ${model} --permission-mode bypassPermissions --append-system-prompt '...'`
+		// ISS-11: --setting-sources project,local now included for worker config isolation
 		expect(cmd).toBe(
-			`claude --model opus --permission-mode bypassPermissions --append-system-prompt '# Coordinator\nYou are the coordinator agent.'`,
+			`claude --model opus --permission-mode bypassPermissions --setting-sources project,local --append-system-prompt '# Coordinator\nYou are the coordinator agent.'`,
 		);
 	});
 
@@ -647,8 +669,9 @@ describe("ClaudeRuntime integration: spawn command matches pre-refactor behavior
 			appendSystemPrompt: baseDefinition,
 			env: { OVERSTORY_AGENT_NAME: "monitor" },
 		});
+		// ISS-11: --setting-sources project,local now included for worker config isolation
 		expect(cmd).toBe(
-			`claude --model sonnet --permission-mode bypassPermissions --append-system-prompt '# Monitor\nYou patrol the fleet.'`,
+			`claude --model sonnet --permission-mode bypassPermissions --setting-sources project,local --append-system-prompt '# Monitor\nYou patrol the fleet.'`,
 		);
 	});
 });
@@ -781,6 +804,8 @@ describe("ClaudeRuntime.buildDirectSpawn", () => {
 			"--strict-mcp-config",
 			"--permission-mode",
 			"bypassPermissions",
+			"--setting-sources",
+			"project,local",
 		]);
 	});
 
@@ -794,7 +819,7 @@ describe("ClaudeRuntime.buildDirectSpawn", () => {
 		const argv = runtime.buildDirectSpawn(opts);
 		expect(argv.at(-2)).toBe("--model");
 		expect(argv.at(-1)).toBe("claude-sonnet-4-6");
-		expect(argv).toHaveLength(12);
+		expect(argv).toHaveLength(14);
 	});
 
 	test("does not include instructionPath in argv", () => {

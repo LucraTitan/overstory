@@ -1333,7 +1333,9 @@ describe("sling runtime integration", () => {
 			cwd: "/tmp/worktree",
 			env: {},
 		});
-		expect(cmd).toBe("claude --model sonnet --permission-mode bypassPermissions");
+		expect(cmd).toBe(
+			"claude --model sonnet --permission-mode bypassPermissions --setting-sources project,local",
+		);
 	});
 
 	test("runtime.buildSpawnCommand with opus model", () => {
@@ -1344,7 +1346,9 @@ describe("sling runtime integration", () => {
 			cwd: "/tmp/worktree",
 			env: {},
 		});
-		expect(cmd).toBe("claude --model opus --permission-mode bypassPermissions");
+		expect(cmd).toBe(
+			"claude --model opus --permission-mode bypassPermissions --setting-sources project,local",
+		);
 	});
 
 	test("runtime.buildEnv returns empty object for native model", () => {

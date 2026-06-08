@@ -58,7 +58,8 @@ export class ClaudeRuntime implements AgentRuntime {
 	 */
 	buildSpawnCommand(opts: SpawnOpts): string {
 		const permMode = opts.permissionMode === "bypass" ? "bypassPermissions" : "default";
-		let cmd = `claude --model ${opts.model} --permission-mode ${permMode}`;
+		// ISS-11: isolate workers from operator's global ~/.claude config (user scope).
+		let cmd = `claude --model ${opts.model} --permission-mode ${permMode} --setting-sources project,local`;
 
 		if (opts.appendSystemPromptFile) {
 			// Read from file at shell expansion time — avoids tmux IPC message size
@@ -92,7 +93,8 @@ export class ClaudeRuntime implements AgentRuntime {
 	 * @returns Argv array for Bun.spawn
 	 */
 	buildPrintCommand(prompt: string, model?: string): string[] {
-		const cmd = ["claude", "--print", "-p", prompt];
+		// ISS-11: isolate workers from operator's global ~/.claude config (user scope).
+		const cmd = ["claude", "--print", "--setting-sources", "project,local", "-p", prompt];
 		if (model !== undefined) {
 			cmd.push("--model", model);
 		}
@@ -261,6 +263,9 @@ export class ClaudeRuntime implements AgentRuntime {
 			"--strict-mcp-config",
 			"--permission-mode",
 			"bypassPermissions",
+			// ISS-11: isolate workers from operator's global ~/.claude config (user scope).
+			"--setting-sources",
+			"project,local",
 		];
 		if (opts.model !== undefined) {
 			argv.push("--model", opts.model);
