@@ -19,6 +19,10 @@ import type {
 	TranscriptSummary,
 } from "./types.ts";
 
+// ISS-11: isolate workers from operator's global ~/.claude config (user scope).
+// Centralised here so all three spawn paths stay in sync.
+const WORKER_SETTING_SOURCES = "project,local";
+
 /**
  * Claude Code runtime adapter.
  *
@@ -58,8 +62,7 @@ export class ClaudeRuntime implements AgentRuntime {
 	 */
 	buildSpawnCommand(opts: SpawnOpts): string {
 		const permMode = opts.permissionMode === "bypass" ? "bypassPermissions" : "default";
-		// ISS-11: isolate workers from operator's global ~/.claude config (user scope).
-		let cmd = `claude --model ${opts.model} --permission-mode ${permMode} --setting-sources project,local`;
+		let cmd = `claude --model ${opts.model} --permission-mode ${permMode} --setting-sources ${WORKER_SETTING_SOURCES}`;
 
 		if (opts.appendSystemPromptFile) {
 			// Read from file at shell expansion time — avoids tmux IPC message size
@@ -93,8 +96,7 @@ export class ClaudeRuntime implements AgentRuntime {
 	 * @returns Argv array for Bun.spawn
 	 */
 	buildPrintCommand(prompt: string, model?: string): string[] {
-		// ISS-11: isolate workers from operator's global ~/.claude config (user scope).
-		const cmd = ["claude", "--print", "--setting-sources", "project,local", "-p", prompt];
+		const cmd = ["claude", "--print", "--setting-sources", WORKER_SETTING_SOURCES, "-p", prompt];
 		if (model !== undefined) {
 			cmd.push("--model", model);
 		}
@@ -263,9 +265,8 @@ export class ClaudeRuntime implements AgentRuntime {
 			"--strict-mcp-config",
 			"--permission-mode",
 			"bypassPermissions",
-			// ISS-11: isolate workers from operator's global ~/.claude config (user scope).
 			"--setting-sources",
-			"project,local",
+			WORKER_SETTING_SOURCES,
 		];
 		if (opts.model !== undefined) {
 			argv.push("--model", opts.model);
