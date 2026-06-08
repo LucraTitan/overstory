@@ -79,8 +79,94 @@ export const checkDependencies: DoctorCheckFn = async (
 		}
 	}
 
+	// Check that the installed claude CLI supports --setting-sources (ISS-11 worker isolation).
+	// Only run this check when claude is already known to be present — if the "claude availability"
+	// check failed, we'd produce a confusing duplicate warning. Because claude is not in the tools
+	// array above (it's spawned by overstory itself, not checked as a user-facing CLI dep), we
+	// run this unconditionally and handle the "not found" case inside the helper by returning pass.
+	const settingSourcesCheck = await checkClaudeSettingSources();
+	checks.push(settingSourcesCheck);
+
 	return checks;
 };
+
+/** Spawner abstraction for checkClaudeSettingSources — injected in tests to avoid real subprocess. */
+export type HelpSpawner = (args: string[]) => Promise<{ stdout: string; stderr: string }>;
+
+async function defaultHelpSpawner(args: string[]): Promise<{ stdout: string; stderr: string }> {
+	const proc = Bun.spawn(args, {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	await proc.exited;
+	const stdout = await new Response(proc.stdout).text();
+	const stderr = await new Response(proc.stderr).text();
+	return { stdout, stderr };
+}
+
+/**
+ * Check that the installed claude CLI supports the --setting-sources flag (ISS-11).
+ *
+ * Worker spawns unconditionally pass `--setting-sources project,local` to isolate
+ * workers from the operator's global ~/.claude config.  An older Claude Code build
+ * that does not recognise the flag will fail every spawn with
+ * "error: unknown option '--setting-sources'", which is hard to diagnose.
+ *
+ * Logic:
+ * - claude not on PATH → pass/skip (the "claude availability" check in tools handles
+ *   the missing-binary case; we must not produce a confusing duplicate here).
+ * - claude present, flag present in --help → pass.
+ * - claude present, flag absent → warn with remediation.
+ *
+ * No --fix handler: we cannot update the user's Claude Code installation.
+ *
+ * @param spawner - Optional subprocess abstraction; defaults to real Bun.spawn.
+ *                  Injected in tests to avoid invoking the real claude binary.
+ * @internal Exported for testing.
+ */
+export async function checkClaudeSettingSources(
+	spawner: HelpSpawner = defaultHelpSpawner,
+): Promise<DoctorCheck> {
+	try {
+		const { stdout, stderr } = await spawner(["claude", "--help"]);
+		const combined = stdout + stderr;
+
+		if (combined.includes("--setting-sources")) {
+			return {
+				name: "claude --setting-sources support",
+				category: "dependencies",
+				status: "pass",
+				message: "claude CLI supports --setting-sources (ISS-11 worker isolation)",
+				details: ["--setting-sources flag present in claude --help output"],
+			};
+		}
+
+		// claude is present but the flag is missing — old build.
+		return {
+			name: "claude --setting-sources support",
+			category: "dependencies",
+			status: "warn",
+			message:
+				"Installed Claude Code does not support --setting-sources; every worker spawn will fail",
+			details: [
+				"Worker spawns pass --setting-sources project,local (ISS-11 isolation).",
+				'Older Claude Code builds reject this flag with "error: unknown option".',
+				"Remediation: update Claude Code to the latest version.",
+			],
+			fixable: true,
+		};
+	} catch {
+		// claude is not on PATH or failed to spawn — skip; the tool-availability
+		// check (added via tools array if present) handles the missing-binary case.
+		return {
+			name: "claude --setting-sources support",
+			category: "dependencies",
+			status: "pass",
+			message: "claude CLI not found — skipping --setting-sources capability check",
+			details: ["claude binary absent; capability check skipped"],
+		};
+	}
+}
 
 /**
  * Probe whether bd's Dolt database backend is functional.

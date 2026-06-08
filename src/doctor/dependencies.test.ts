@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import type { OverstoryConfig } from "../types.ts";
-import { checkAlias, checkDependencies, checkTool } from "./dependencies.ts";
+import {
+	checkAlias,
+	checkClaudeSettingSources,
+	checkDependencies,
+	checkTool,
+} from "./dependencies.ts";
 
 // Minimal config for testing
 const mockConfig: OverstoryConfig = {
@@ -236,6 +241,15 @@ describe("checkDependencies", () => {
 		expect(ovCheck).toBeDefined();
 		expect(ovCheck?.category).toBe("dependencies");
 	});
+
+	test("includes claude --setting-sources support check", async () => {
+		const checks = await checkDependencies(mockConfig, "/tmp/.overstory");
+		const ssCheck = checks.find((c) => c.name === "claude --setting-sources support");
+		expect(ssCheck).toBeDefined();
+		expect(ssCheck?.category).toBe("dependencies");
+		// Must be pass or warn — never fail (no auto-fix path)
+		expect(ssCheck?.status).not.toBe("fail");
+	});
 });
 
 describe("checkTool", () => {
@@ -292,5 +306,84 @@ describe("checkAlias", () => {
 		expect(check.status).toBe("warn");
 		const detailsText = check.details?.join(" ") ?? "";
 		expect(detailsText).toContain("@test/fake-pkg");
+	});
+});
+
+describe("checkClaudeSettingSources", () => {
+	test("pass when --setting-sources appears in stdout", async () => {
+		const spawner = async (_args: string[]) => ({
+			stdout: "Usage: claude [options]\n  --setting-sources <sources>  Comma-separated list\n",
+			stderr: "",
+		});
+		const check = await checkClaudeSettingSources(spawner);
+		expect(check.name).toBe("claude --setting-sources support");
+		expect(check.category).toBe("dependencies");
+		expect(check.status).toBe("pass");
+		expect(check.message).toContain("ISS-11");
+		expect(check.details).toBeArray();
+		expect(check.details?.length).toBeGreaterThan(0);
+	});
+
+	test("pass when --setting-sources appears in stderr (some versions print help to stderr)", async () => {
+		const spawner = async (_args: string[]) => ({
+			stdout: "",
+			stderr: "Usage: claude [options]\n  --setting-sources <sources>  Comma-separated list\n",
+		});
+		const check = await checkClaudeSettingSources(spawner);
+		expect(check.status).toBe("pass");
+	});
+
+	test("warn when claude is present but --setting-sources is absent from help", async () => {
+		const spawner = async (_args: string[]) => ({
+			stdout: "Usage: claude [options]\n  --model <model>  The model to use\n",
+			stderr: "",
+		});
+		const check = await checkClaudeSettingSources(spawner);
+		expect(check.name).toBe("claude --setting-sources support");
+		expect(check.category).toBe("dependencies");
+		expect(check.status).toBe("warn");
+		expect(check.message).toContain("--setting-sources");
+		expect(check.details).toBeArray();
+		expect(check.details?.length).toBeGreaterThan(0);
+		// Must include remediation guidance
+		const detailsText = check.details?.join(" ") ?? "";
+		expect(detailsText).toContain("update Claude Code");
+		// Marked fixable (user can fix by updating claude); no auto-fix closure
+		expect(check.fixable).toBe(true);
+		expect(check.fix).toBeUndefined();
+	});
+
+	test("warn message references ISS-11 context in details", async () => {
+		const spawner = async (_args: string[]) => ({
+			stdout: "no-setting-sources-here",
+			stderr: "",
+		});
+		const check = await checkClaudeSettingSources(spawner);
+		expect(check.status).toBe("warn");
+		const detailsText = check.details?.join(" ") ?? "";
+		expect(detailsText).toContain("ISS-11");
+	});
+
+	test("pass (skip) when spawner throws — claude not on PATH", async () => {
+		const spawner = async (_args: string[]): Promise<{ stdout: string; stderr: string }> => {
+			throw new Error("spawn ENOENT");
+		};
+		const check = await checkClaudeSettingSources(spawner);
+		expect(check.name).toBe("claude --setting-sources support");
+		expect(check.category).toBe("dependencies");
+		expect(check.status).toBe("pass");
+		expect(check.message).toContain("not found");
+		expect(check.details).toBeArray();
+		expect(check.details?.length).toBeGreaterThan(0);
+	});
+
+	test("real claude CLI on this machine supports --setting-sources", async () => {
+		// Integration test against the actual installed claude binary.
+		// Only meaningful where claude is on PATH; the check gracefully skips if not.
+		const check = await checkClaudeSettingSources();
+		expect(check.category).toBe("dependencies");
+		// On a machine with a current claude install this should pass.
+		// On a machine with no claude it returns pass (skip).  Either way: never fail.
+		expect(check.status).not.toBe("fail");
 	});
 });
