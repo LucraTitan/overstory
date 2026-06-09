@@ -87,6 +87,13 @@ export const checkDependencies: DoctorCheckFn = async (
 	const settingSourcesCheck = await checkClaudeSettingSources();
 	checks.push(settingSourcesCheck);
 
+	// Check that the installed claude CLI supports --disable-slash-commands.
+	// All headless worker spawns (buildDirectSpawn + buildPrintCommand) pass this flag to avoid
+	// loading the skill surface and save tokens. An older Claude Code build that does not recognise
+	// the flag will fail every spawn with "error: unknown option '--disable-slash-commands'".
+	const disableSlashCommandsCheck = await checkClaudeDisableSlashCommands();
+	checks.push(disableSlashCommandsCheck);
+
 	return checks;
 };
 
@@ -163,6 +170,70 @@ export async function checkClaudeSettingSources(
 			category: "dependencies",
 			status: "pass",
 			message: "claude CLI not found — skipping --setting-sources capability check",
+			details: ["claude binary absent; capability check skipped"],
+		};
+	}
+}
+
+/**
+ * Check that the installed claude CLI supports the --disable-slash-commands flag.
+ *
+ * All headless worker spawns pass `--disable-slash-commands` to skip loading the
+ * skill surface, saving tokens. An older Claude Code build that does not recognise
+ * the flag will fail every spawn with
+ * "error: unknown option '--disable-slash-commands'", which is hard to diagnose.
+ *
+ * Logic:
+ * - claude not on PATH → pass/skip (the "claude availability" check handles the
+ *   missing-binary case; we must not produce a confusing duplicate here).
+ * - claude present, flag present in --help → pass.
+ * - claude present, flag absent → warn with remediation.
+ *
+ * No --fix handler: we cannot update the user's Claude Code installation.
+ *
+ * @param spawner - Optional subprocess abstraction; defaults to real Bun.spawn.
+ *                  Injected in tests to avoid invoking the real claude binary.
+ * @internal Exported for testing.
+ */
+export async function checkClaudeDisableSlashCommands(
+	spawner: HelpSpawner = defaultHelpSpawner,
+): Promise<DoctorCheck> {
+	try {
+		const { stdout, stderr } = await spawner(["claude", "--help"]);
+		const combined = stdout + stderr;
+
+		if (combined.includes("--disable-slash-commands")) {
+			return {
+				name: "claude --disable-slash-commands support",
+				category: "dependencies",
+				status: "pass",
+				message: "claude CLI supports --disable-slash-commands (headless worker token savings)",
+				details: ["--disable-slash-commands flag present in claude --help output"],
+			};
+		}
+
+		// claude is present but the flag is missing — old build.
+		return {
+			name: "claude --disable-slash-commands support",
+			category: "dependencies",
+			status: "warn",
+			message:
+				"Installed Claude Code does not support --disable-slash-commands; every worker spawn will fail",
+			details: [
+				"Worker spawns pass --disable-slash-commands to skip loading the skill surface.",
+				'Older Claude Code builds reject this flag with "error: unknown option".',
+				"Remediation: update Claude Code to the latest version.",
+			],
+			fixable: true,
+		};
+	} catch {
+		// claude is not on PATH or failed to spawn — skip; the tool-availability
+		// check handles the missing-binary case.
+		return {
+			name: "claude --disable-slash-commands support",
+			category: "dependencies",
+			status: "pass",
+			message: "claude CLI not found — skipping --disable-slash-commands capability check",
 			details: ["claude binary absent; capability check skipped"],
 		};
 	}

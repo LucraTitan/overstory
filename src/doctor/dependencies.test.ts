@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { OverstoryConfig } from "../types.ts";
 import {
 	checkAlias,
+	checkClaudeDisableSlashCommands,
 	checkClaudeSettingSources,
 	checkDependencies,
 	checkTool,
@@ -381,6 +382,85 @@ describe("checkClaudeSettingSources", () => {
 		// Integration test against the actual installed claude binary.
 		// Only meaningful where claude is on PATH; the check gracefully skips if not.
 		const check = await checkClaudeSettingSources();
+		expect(check.category).toBe("dependencies");
+		// On a machine with a current claude install this should pass.
+		// On a machine with no claude it returns pass (skip).  Either way: never fail.
+		expect(check.status).not.toBe("fail");
+	});
+});
+
+describe("checkClaudeDisableSlashCommands", () => {
+	test("pass when --disable-slash-commands appears in stdout", async () => {
+		const spawner = async (_args: string[]) => ({
+			stdout: "Usage: claude [options]\n  --disable-slash-commands  Disable slash commands\n",
+			stderr: "",
+		});
+		const check = await checkClaudeDisableSlashCommands(spawner);
+		expect(check.name).toBe("claude --disable-slash-commands support");
+		expect(check.category).toBe("dependencies");
+		expect(check.status).toBe("pass");
+		expect(check.message).toContain("--disable-slash-commands");
+		expect(check.details).toBeArray();
+		expect(check.details?.length).toBeGreaterThan(0);
+	});
+
+	test("pass when --disable-slash-commands appears in stderr (some versions print help to stderr)", async () => {
+		const spawner = async (_args: string[]) => ({
+			stdout: "",
+			stderr: "Usage: claude [options]\n  --disable-slash-commands  Disable slash commands\n",
+		});
+		const check = await checkClaudeDisableSlashCommands(spawner);
+		expect(check.status).toBe("pass");
+	});
+
+	test("warn when claude is present but --disable-slash-commands is absent from help", async () => {
+		const spawner = async (_args: string[]) => ({
+			stdout: "Usage: claude [options]\n  --model <model>  The model to use\n",
+			stderr: "",
+		});
+		const check = await checkClaudeDisableSlashCommands(spawner);
+		expect(check.name).toBe("claude --disable-slash-commands support");
+		expect(check.category).toBe("dependencies");
+		expect(check.status).toBe("warn");
+		expect(check.message).toContain("--disable-slash-commands");
+		expect(check.details).toBeArray();
+		expect(check.details?.length).toBeGreaterThan(0);
+		// Must include remediation guidance
+		const detailsText = check.details?.join(" ") ?? "";
+		expect(detailsText).toContain("update Claude Code");
+		// Marked fixable (user can fix by updating claude); no auto-fix closure
+		expect(check.fixable).toBe(true);
+		expect(check.fix).toBeUndefined();
+	});
+
+	test("warn message explains workers spawn with --disable-slash-commands", async () => {
+		const spawner = async (_args: string[]) => ({
+			stdout: "no-disable-slash-commands-here",
+			stderr: "",
+		});
+		const check = await checkClaudeDisableSlashCommands(spawner);
+		expect(check.status).toBe("warn");
+		const detailsText = check.details?.join(" ") ?? "";
+		expect(detailsText).toContain("--disable-slash-commands");
+	});
+
+	test("pass (skip) when spawner throws — claude not on PATH", async () => {
+		const spawner = async (_args: string[]): Promise<{ stdout: string; stderr: string }> => {
+			throw new Error("spawn ENOENT");
+		};
+		const check = await checkClaudeDisableSlashCommands(spawner);
+		expect(check.name).toBe("claude --disable-slash-commands support");
+		expect(check.category).toBe("dependencies");
+		expect(check.status).toBe("pass");
+		expect(check.message).toContain("not found");
+		expect(check.details).toBeArray();
+		expect(check.details?.length).toBeGreaterThan(0);
+	});
+
+	test("real claude CLI on this machine — never returns fail", async () => {
+		// Integration test against the actual installed claude binary.
+		// Only meaningful where claude is on PATH; the check gracefully skips if not.
+		const check = await checkClaudeDisableSlashCommands();
 		expect(check.category).toBe("dependencies");
 		// On a machine with a current claude install this should pass.
 		// On a machine with no claude it returns pass (skip).  Either way: never fail.

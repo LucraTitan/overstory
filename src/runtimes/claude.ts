@@ -96,7 +96,15 @@ export class ClaudeRuntime implements AgentRuntime {
 	 * @returns Argv array for Bun.spawn
 	 */
 	buildPrintCommand(prompt: string, model?: string): string[] {
-		const cmd = ["claude", "--print", "--setting-sources", WORKER_SETTING_SOURCES, "-p", prompt];
+		const cmd = [
+			"claude",
+			"--print",
+			"--setting-sources",
+			WORKER_SETTING_SOURCES,
+			"--disable-slash-commands",
+			"-p",
+			prompt,
+		];
 		if (model !== undefined) {
 			cmd.push("--model", model);
 		}
@@ -263,6 +271,7 @@ export class ClaudeRuntime implements AgentRuntime {
 			"stream-json",
 			"--verbose",
 			"--strict-mcp-config",
+			"--disable-slash-commands",
 			"--permission-mode",
 			"bypassPermissions",
 			"--setting-sources",

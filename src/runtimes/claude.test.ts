@@ -190,6 +190,7 @@ describe("ClaudeRuntime", () => {
 				"--print",
 				"--setting-sources",
 				"project,local",
+				"--disable-slash-commands",
 				"-p",
 				"Summarize this diff",
 			]);
@@ -202,6 +203,7 @@ describe("ClaudeRuntime", () => {
 				"--print",
 				"--setting-sources",
 				"project,local",
+				"--disable-slash-commands",
 				"-p",
 				"Classify this error",
 				"--model",
@@ -212,6 +214,11 @@ describe("ClaudeRuntime", () => {
 		test("model undefined omits --model flag", () => {
 			const argv = runtime.buildPrintCommand("Hello", undefined);
 			expect(argv).not.toContain("--model");
+		});
+
+		test("always includes --disable-slash-commands", () => {
+			const argv = runtime.buildPrintCommand("Any prompt");
+			expect(argv).toContain("--disable-slash-commands");
 		});
 	});
 
@@ -802,6 +809,7 @@ describe("ClaudeRuntime.buildDirectSpawn", () => {
 			"stream-json",
 			"--verbose",
 			"--strict-mcp-config",
+			"--disable-slash-commands",
 			"--permission-mode",
 			"bypassPermissions",
 			"--setting-sources",
@@ -819,7 +827,7 @@ describe("ClaudeRuntime.buildDirectSpawn", () => {
 		const argv = runtime.buildDirectSpawn(opts);
 		expect(argv.at(-2)).toBe("--model");
 		expect(argv.at(-1)).toBe("claude-sonnet-4-6");
-		expect(argv).toHaveLength(14);
+		expect(argv).toHaveLength(15);
 	});
 
 	test("does not include instructionPath in argv", () => {
