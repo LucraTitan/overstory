@@ -23,6 +23,7 @@ import { createErrorsCommand } from "./commands/errors.ts";
 import { createFeedCommand } from "./commands/feed.ts";
 import { createGroupCommand } from "./commands/group.ts";
 import { createHooksCommand } from "./commands/hooks.ts";
+import { createIngestCommand } from "./commands/ingest.ts";
 import { initCommand } from "./commands/init.ts";
 import { createInspectCommand } from "./commands/inspect.ts";
 import { createLogCommand } from "./commands/log.ts";
@@ -74,6 +75,7 @@ const COMMANDS = [
 	"agents",
 	"init",
 	"sling",
+	"ingest",
 	"spec",
 	"prime",
 	"stop",
@@ -355,6 +357,7 @@ program.addCommand(createStatusCommand());
 program.addCommand(createDashboardCommand());
 
 program.addCommand(createDiscoverCommand());
+program.addCommand(createIngestCommand());
 
 program.addCommand(createInspectCommand());
 
