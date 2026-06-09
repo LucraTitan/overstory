@@ -5,6 +5,7 @@ import {
 	checkClaudeDisableSlashCommands,
 	checkClaudeSettingSources,
 	checkDependencies,
+	checkSdPlanSubmit,
 	checkTool,
 } from "./dependencies.ts";
 
@@ -464,6 +465,89 @@ describe("checkClaudeDisableSlashCommands", () => {
 		expect(check.category).toBe("dependencies");
 		// On a machine with a current claude install this should pass.
 		// On a machine with no claude it returns pass (skip).  Either way: never fail.
+		expect(check.status).not.toBe("fail");
+	});
+});
+
+describe("checkSdPlanSubmit", () => {
+	test("pass when sd plan --help output mentions 'plan submit'", async () => {
+		const spawner = async (_args: string[]) => ({
+			stdout: "sd plan submit  Submit a plan for a seed\n  --overwrite  Overwrite existing plan\n",
+			stderr: "",
+		});
+		const check = await checkSdPlanSubmit(spawner);
+		expect(check.name).toBe("sd plan submit support");
+		expect(check.category).toBe("dependencies");
+		expect(check.status).toBe("pass");
+		expect(check.message).toContain("plan submit");
+		expect(check.details).toBeArray();
+		expect(check.details?.length).toBeGreaterThan(0);
+	});
+
+	test("pass when 'plan submit' appears in stderr (some sd versions print help to stderr)", async () => {
+		const spawner = async (_args: string[]) => ({
+			stdout: "",
+			stderr: "sd plan submit  Submit a plan\n  --overwrite  Overwrite plan\n",
+		});
+		const check = await checkSdPlanSubmit(spawner);
+		expect(check.status).toBe("pass");
+	});
+
+	test("pass when only '--overwrite' appears (sufficient signal)", async () => {
+		const spawner = async (_args: string[]) => ({
+			stdout: "Commands:\n  submit  submit a plan\n    --overwrite   replace existing\n",
+			stderr: "",
+		});
+		const check = await checkSdPlanSubmit(spawner);
+		expect(check.status).toBe("pass");
+	});
+
+	test("warn when sd is present but 'plan submit' and '--overwrite' are absent from help", async () => {
+		const spawner = async (_args: string[]) => ({
+			stdout: "Usage: sd [options]\n  create  Create a seed\n",
+			stderr: "",
+		});
+		const check = await checkSdPlanSubmit(spawner);
+		expect(check.name).toBe("sd plan submit support");
+		expect(check.category).toBe("dependencies");
+		expect(check.status).toBe("warn");
+		expect(check.message).toContain("plan submit");
+		expect(check.details).toBeArray();
+		expect(check.details?.length).toBeGreaterThan(0);
+		const detailsText = check.details?.join(" ") ?? "";
+		expect(detailsText).toContain("@os-eco/seeds-cli");
+	});
+
+	test("warn message mentions ov ingest dependency", async () => {
+		const spawner = async (_args: string[]) => ({
+			stdout: "no-plan-submit-here",
+			stderr: "",
+		});
+		const check = await checkSdPlanSubmit(spawner);
+		expect(check.status).toBe("warn");
+		expect(check.message).toContain("ov ingest");
+	});
+
+	test("pass (skip) when spawner throws — sd not on PATH", async () => {
+		const spawner = async (_args: string[]): Promise<{ stdout: string; stderr: string }> => {
+			throw new Error("spawn ENOENT");
+		};
+		const check = await checkSdPlanSubmit(spawner);
+		expect(check.name).toBe("sd plan submit support");
+		expect(check.category).toBe("dependencies");
+		expect(check.status).toBe("pass");
+		expect(check.message).toContain("not found");
+		expect(check.details).toBeArray();
+		expect(check.details?.length).toBeGreaterThan(0);
+	});
+
+	test("real sd CLI on this machine — never returns fail", async () => {
+		// Integration test against the actual installed sd binary.
+		// Only meaningful where sd is on PATH; the check gracefully skips if not.
+		const check = await checkSdPlanSubmit();
+		expect(check.category).toBe("dependencies");
+		// On a machine with a current sd install this should pass or warn.
+		// On a machine with no sd it returns pass (skip).  Either way: never fail.
 		expect(check.status).not.toBe("fail");
 	});
 });

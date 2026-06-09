@@ -94,6 +94,13 @@ export const checkDependencies: DoctorCheckFn = async (
 	const disableSlashCommandsCheck = await checkClaudeDisableSlashCommands();
 	checks.push(disableSlashCommandsCheck);
 
+	// Check that the installed sd CLI supports the plan-submit surface required by ov ingest.
+	// Only run when sd is the tracker backend — if sd was not resolved, this check is irrelevant.
+	if (trackerName === "sd") {
+		const sdPlanSubmitCheck = await checkSdPlanSubmit();
+		checks.push(sdPlanSubmitCheck);
+	}
+
 	return checks;
 };
 
@@ -171,6 +178,69 @@ export async function checkClaudeSettingSources(
 			status: "pass",
 			message: "claude CLI not found — skipping --setting-sources capability check",
 			details: ["claude binary absent; capability check skipped"],
+		};
+	}
+}
+
+/**
+ * Check that the installed sd CLI supports the plan-submit surface required by `ov ingest`.
+ *
+ * `ov ingest` drives `sd plan submit` (fresh create) and `sd plan submit --overwrite`
+ * (reconcile). Older sd builds that lack this subcommand will cause every ingest to fail
+ * at apply-time with a cryptic "unknown command" error.
+ *
+ * Logic:
+ * - sd not on PATH → pass/skip (the "sd availability" check handles the missing-binary
+ *   case; we must not produce a confusing duplicate here).
+ * - sd present, "plan submit" or "--overwrite" in help output → pass.
+ * - sd present, neither token present → warn with upgrade hint.
+ *
+ * No --fix handler: we cannot update the user's seeds-cli installation.
+ *
+ * @param spawner - Optional subprocess abstraction; defaults to real Bun.spawn.
+ *                  Injected in tests to avoid invoking the real sd binary.
+ * @internal Exported for testing.
+ */
+export async function checkSdPlanSubmit(
+	spawner: HelpSpawner = defaultHelpSpawner,
+): Promise<DoctorCheck> {
+	try {
+		const { stdout, stderr } = await spawner(["sd", "plan", "--help"]);
+		const combined = stdout + stderr;
+
+		if (combined.includes("plan submit") || combined.includes("--overwrite")) {
+			return {
+				name: "sd plan submit support",
+				category: "dependencies",
+				status: "pass",
+				message: "sd supports plan submit (required by ov ingest)",
+				details: ["sd plan submit / --overwrite flag present in sd plan --help output"],
+			};
+		}
+
+		// sd is present but the plan submit surface is absent — old build.
+		return {
+			name: "sd plan submit support",
+			category: "dependencies",
+			status: "warn",
+			message:
+				"Installed sd lacks 'plan submit'; ov ingest cannot create plans — update @os-eco/seeds-cli",
+			details: [
+				"ov ingest drives 'sd plan submit' (fresh create) and 'sd plan submit --overwrite' (reconcile).",
+				"Neither 'plan submit' nor '--overwrite' was found in sd plan --help output.",
+				"Remediation: npm install -g @os-eco/seeds-cli (or bun add -g @os-eco/seeds-cli).",
+			],
+			fixable: true,
+		};
+	} catch {
+		// sd is not on PATH or failed to spawn — skip; the tool-availability
+		// check (added via tools array) handles the missing-binary case.
+		return {
+			name: "sd plan submit support",
+			category: "dependencies",
+			status: "pass",
+			message: "sd CLI not found — skipping plan submit capability check",
+			details: ["sd binary absent; capability check skipped"],
 		};
 	}
 }
