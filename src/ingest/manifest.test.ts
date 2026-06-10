@@ -74,6 +74,39 @@ describe("classifySource", () => {
 		const result = classifySource(populatedManifest, "docs/other.md", "sha256:abc123");
 		expect(result).toBe("new");
 	});
+
+	test("entry with partial:true and MATCHING hash → 'changed' (not 'unchanged')", () => {
+		// This is the core regression guard: a partial entry with the same hash must NOT no-op.
+		const partialManifest: IngestionManifest = {
+			schemaVersion: 1,
+			sources: {
+				"docs/prd.md": {
+					contentHash: "sha256:abc123",
+					ingestedAt: "2026-06-09T12:00:00Z",
+					groups: [],
+					partial: true,
+				},
+			},
+		};
+		const result = classifySource(partialManifest, "docs/prd.md", "sha256:abc123");
+		expect(result).toBe("changed");
+	});
+
+	test("entry with partial:true and DIFFERENT hash → 'changed'", () => {
+		const partialManifest: IngestionManifest = {
+			schemaVersion: 1,
+			sources: {
+				"docs/prd.md": {
+					contentHash: "sha256:abc123",
+					ingestedAt: "2026-06-09T12:00:00Z",
+					groups: [],
+					partial: true,
+				},
+			},
+		};
+		const result = classifySource(partialManifest, "docs/prd.md", "sha256:different");
+		expect(result).toBe("changed");
+	});
 });
 
 // --- B7: corrupt manifest → clear AgentError ---

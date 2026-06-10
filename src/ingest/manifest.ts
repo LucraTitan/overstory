@@ -25,6 +25,9 @@ export function hashContent(bytes: Buffer): string {
 /**
  * Classify a source path relative to the manifest.
  * Pure — no I/O.
+ *
+ * If the existing entry has `partial:true` (a prior apply failed mid-way), always return
+ * "changed" so the caller takes the reconcile path — regardless of whether the hash matches.
  */
 export function classifySource(
 	manifest: IngestionManifest,
@@ -33,6 +36,8 @@ export function classifySource(
 ): SourceClassification {
 	const entry = manifest.sources[path];
 	if (entry === undefined) return "new";
+	// Partial entry: force reconcile so missing groups are created on re-run (never no-op).
+	if (entry.partial === true) return "changed";
 	return entry.contentHash === contentHash ? "unchanged" : "changed";
 }
 

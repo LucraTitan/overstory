@@ -100,6 +100,8 @@ export interface ManifestSourceEntry {
 	contentHash: string;
 	ingestedAt: string; // ISO8601
 	groups: ManifestGroupEntry[];
+	/** Set when a prior apply failed mid-way; forces the next run to reconcile. */
+	partial?: true;
 }
 
 export interface IngestionManifest {

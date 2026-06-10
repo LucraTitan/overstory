@@ -557,16 +557,160 @@ describe("ingestCommand — B1: partial failure writes partial manifest", () => 
 
 		expect(threw).toBe(true); // must re-throw
 
-		// Partial manifest must be written with the completed group (g1)
+		// Partial manifest must be written with the completed group (g1) and partial:true flag
 		const { readFile: rf } = await import("node:fs/promises");
 		const manifestContent = await rf(manifestPath, "utf8");
 		const manifest = JSON.parse(manifestContent) as {
-			sources: Record<string, { groups: Array<{ logicalId: string }> }>;
+			sources: Record<string, { groups: Array<{ logicalId: string }>; partial?: boolean }>;
 		};
-		const groups = manifest.sources["docs/partial.md"]?.groups ?? [];
+		const sourceEntry = manifest.sources["docs/partial.md"];
+		const groups = sourceEntry?.groups ?? [];
 		const completedLogicalIds = groups.map((g) => g.logicalId);
 		expect(completedLogicalIds).toContain("g1");
 		expect(completedLogicalIds).not.toContain("g2"); // g2 failed, not recorded
+		// B1 fix: partial:true must be set so re-run classifies as "changed" (not "unchanged")
+		expect(sourceEntry?.partial).toBe(true);
+	});
+});
+
+describe("ingestCommand — partial-failure regression: re-run reconciles, no silent drop, no duplicate", () => {
+	const TWO_GROUP_PLAN: NormalizedPlan = {
+		schemaVersion: 1,
+		source: { path: "docs/reconcile.md", contentHash: "sha256:reconcile111" },
+		groups: [
+			{
+				kind: "standalone",
+				logicalId: "g1",
+				title: "Group One",
+				type: "task",
+				priority: 2,
+				description: "First group — always succeeds",
+				acceptance: [],
+				sourceSpan: { start: 0, end: 100 },
+				confidence: "high",
+			},
+			{
+				kind: "standalone",
+				logicalId: "g2",
+				title: "Group Two",
+				type: "task",
+				priority: 2,
+				description: "Second group — fails on first run, succeeds on second",
+				acceptance: [],
+				sourceSpan: { start: 100, end: 200 },
+				confidence: "high",
+			},
+		],
+		ambiguities: [],
+	};
+
+	test("re-run after partial failure: g1 adopted (no duplicate), g2 created, partial flag cleared", async () => {
+		const planPath = await writePlanFile(TWO_GROUP_PLAN);
+		await ensureOvDir();
+		const manifestPath = join(tempDir, ".overstory", "ingestion-manifest.json");
+
+		// --- Run 1: g1 succeeds, g2 throws → partial manifest written ---
+		const g1SeedId = "proj-partial-0001";
+		let run1Calls = 0;
+		const run1Client: SeedsPlanClient = {
+			async executeCreate(_op: CreateOp): Promise<string> {
+				run1Calls++;
+				if (run1Calls === 1) return g1SeedId; // g1 succeeds
+				throw new Error("simulated: g2 create failed");
+			},
+			async executePlanSubmit(_parentId: string, _op: PlanSubmitOp): Promise<PlanSubmitResult> {
+				throw new Error("should not be called in run 1");
+			},
+		};
+
+		let run1Threw = false;
+		try {
+			await ingestCommand(
+				{
+					plan: planPath,
+					apply: true,
+					newPlan: false,
+					manifest: manifestPath,
+					cwd: tempDir,
+					json: false,
+				},
+				run1Client,
+			);
+		} catch {
+			run1Threw = true;
+		}
+		expect(run1Threw).toBe(true);
+
+		// Verify partial manifest: g1 present, partial:true
+		const { readFile: rf } = await import("node:fs/promises");
+		const partial = JSON.parse(await rf(manifestPath, "utf8")) as {
+			sources: Record<
+				string,
+				{ groups: Array<{ logicalId: string; seedId: string }>; partial?: boolean }
+			>;
+		};
+		const partialEntry = partial.sources["docs/reconcile.md"];
+		expect(partialEntry?.partial).toBe(true);
+		expect(partialEntry?.groups.map((g) => g.logicalId)).toContain("g1");
+		expect(partialEntry?.groups.map((g) => g.logicalId)).not.toContain("g2");
+
+		// --- Run 2: same plan, g2 now succeeds. g1 must be ADOPTED (existingSeedId path), NOT re-created. ---
+		const run2CreateCalls: Array<{ existingSeedId?: string; title?: string }> = [];
+		const g2SeedId = "proj-run2-g2-0001";
+		const run2Client: SeedsPlanClient = {
+			async executeCreate(op: CreateOp): Promise<string> {
+				run2CreateCalls.push({
+					existingSeedId: op.existingSeedId,
+					title: op.args[op.args.indexOf("--title") + 1],
+				});
+				// The fake client from the harness returns existingSeedId when set (adopt path)
+				if (op.existingSeedId !== undefined) return op.existingSeedId;
+				return g2SeedId;
+			},
+			async executePlanSubmit(_parentId: string, _op: PlanSubmitOp): Promise<PlanSubmitResult> {
+				throw new Error("should not be called in run 2 (standalone only)");
+			},
+		};
+
+		// Run 2 MUST NOT throw
+		const run2Result = await ingestCommand(
+			{
+				plan: planPath,
+				apply: true,
+				newPlan: false,
+				manifest: manifestPath,
+				cwd: tempDir,
+				json: false,
+			},
+			run2Client,
+		);
+		expect(run2Result.exitCode).toBe(0);
+
+		// g1 must be adopted (existingSeedId set on its create op) — NOT a fresh create
+		const g1Call = run2CreateCalls.find((c) => c.existingSeedId === g1SeedId);
+		expect(g1Call).toBeDefined(); // adopted, not duplicated
+
+		// g2 must be created fresh (no existingSeedId)
+		const g2Call = run2CreateCalls.find(
+			(c) => c.existingSeedId === undefined && c.title === "Group Two",
+		);
+		expect(g2Call).toBeDefined();
+
+		// Total: exactly 2 executeCreate calls (one adopt for g1 + one create for g2)
+		expect(run2CreateCalls).toHaveLength(2);
+
+		// Final manifest: partial flag must be cleared, both groups present
+		const finalRaw = JSON.parse(await rf(manifestPath, "utf8")) as {
+			sources: Record<
+				string,
+				{ groups: Array<{ logicalId: string }>; partial?: boolean; contentHash: string }
+			>;
+		};
+		const finalEntry = finalRaw.sources["docs/reconcile.md"];
+		expect(finalEntry?.partial).toBeUndefined(); // cleared on successful reconcile
+		expect(finalEntry?.contentHash).toBe("sha256:reconcile111");
+		expect(finalEntry?.groups.map((g) => g.logicalId)).toContain("g1");
+		expect(finalEntry?.groups.map((g) => g.logicalId)).toContain("g2");
 	});
 });
 

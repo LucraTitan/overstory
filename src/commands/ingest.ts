@@ -171,6 +171,10 @@ export async function ingestCommand(
 					freshCreated.push(parentId);
 					freshLogicalIdToSeedId.set(group.logicalId, parentId);
 
+					// KNOWN LIMITATION (v1): if executeCreate above SUCCEEDS but executePlanSubmit
+					// below FAILS, this group is NOT added to freshCompletedGroups, so on re-run a
+					// NEW parent seed is created — producing a duplicate orphan parent.
+					// Fully solving this requires recording the orphan parentId; deferred to v2.
 					const submitOp = freshOps[freshOpIndex++];
 					if (submitOp === undefined || submitOp.op !== "planSubmit") continue;
 					const submitResult = await freshClient.executePlanSubmit(parentId, submitOp);
@@ -199,7 +203,8 @@ export async function ingestCommand(
 				}
 			}
 		} catch (applyErr: unknown) {
-			// B1: partial failure — write PARTIAL manifest for completed groups, then re-throw
+			// B1: partial failure — write PARTIAL manifest for completed groups, then re-throw.
+			// partial:true ensures a re-run classifies as "changed" and reconciles (never no-ops).
 			if (freshCompletedGroups.length > 0) {
 				const partialIngestedAt = new Date().toISOString();
 				const partialManifest = updateManifest(
@@ -210,6 +215,7 @@ export async function ingestCommand(
 					freshCompletedGroups,
 					freshLogicalIdToSeedId,
 					freshPlanInfoMap,
+					true, // partial — forces reconcile on re-run
 				);
 				try {
 					await saveManifest(manifestPath, partialManifest);
@@ -374,6 +380,10 @@ export async function ingestCommand(
 				logicalIdToSeedId.set(group.logicalId, parentId);
 
 				// planSubmit
+				// KNOWN LIMITATION (v1): if executeCreate above SUCCEEDS but executePlanSubmit below
+				// FAILS, this group is NOT added to completedGroups, so on re-run it is treated as
+				// missing and a NEW parent seed is created — producing a duplicate orphan parent.
+				// Fully solving this requires recording the orphan parentId; deferred to v2.
 				const submitOp = operations[opIndex++];
 				if (submitOp === undefined || submitOp.op !== "planSubmit") continue;
 				const submitResult = await client.executePlanSubmit(parentId, submitOp);
@@ -404,7 +414,8 @@ export async function ingestCommand(
 			}
 		}
 	} catch (applyErr: unknown) {
-		// B1: partial failure — write PARTIAL manifest for completed groups, then re-throw
+		// B1: partial failure — write PARTIAL manifest for completed groups, then re-throw.
+		// partial:true ensures a re-run classifies as "changed" and reconciles (never no-ops).
 		if (completedGroups.length > 0) {
 			const partialIngestedAt = new Date().toISOString();
 			const partialManifest = updateManifest(
@@ -415,6 +426,7 @@ export async function ingestCommand(
 				completedGroups,
 				logicalIdToSeedId,
 				planInfoMap,
+				true, // partial — forces reconcile on re-run
 			);
 			try {
 				await saveManifest(manifestPath, partialManifest);
@@ -522,6 +534,7 @@ function updateManifest(
 		string,
 		{ planId: string; children: string[]; obsolete: string[]; unitIds: Map<string, string> }
 	>,
+	partial = false,
 ): IngestionManifest {
 	const newGroups: ManifestGroupEntry[] = [];
 
@@ -560,6 +573,8 @@ function updateManifest(
 		contentHash,
 		ingestedAt,
 		groups: newGroups,
+		// Only write `partial:true` when flagged — omit the field entirely on clean entries.
+		...(partial ? { partial: true as const } : {}),
 	};
 
 	return {
