@@ -31,7 +31,7 @@ function makePlan(overrides: Partial<PlanGroup> = {}): PlanGroup {
 		title: "Phase 1",
 		type: "feature",
 		priority: 1,
-		description: "Big feature",
+		description: "A big feature that implements the core functionality of the system end-to-end.",
 		acceptance: ["Feature ships"],
 		template: "feature",
 		sourceSpan: { start: 0, end: 500 },
@@ -164,7 +164,8 @@ describe("validateNormalizedPlan — reject: dependsOn to non-sibling", () => {
 			title: "Phase 2",
 			type: "feature",
 			priority: 1,
-			description: "d",
+			description:
+				"Phase 2 of the feature implementing secondary functionality with cross-plan reference test.",
 			acceptance: ["a"],
 			template: "feature",
 			sourceSpan: { start: 500, end: 1000 },
@@ -226,7 +227,8 @@ describe("validateNormalizedPlan — reject: dependency cycle", () => {
 					title: "Plan",
 					type: "feature",
 					priority: 1,
-					description: "d",
+					description:
+						"A feature plan with cyclic dependencies to test the cycle detection algorithm.",
 					acceptance: ["a"],
 					template: "feature",
 					sourceSpan: { start: 0, end: 1000 },
@@ -315,6 +317,102 @@ describe("validateNormalizedPlan — reject: missing required fields", () => {
 		expect(result.ok).toBe(false);
 		if (!result.ok) {
 			expect(result.errors.some((e) => e.includes("template"))).toBe(true);
+		}
+	});
+});
+
+// --- B4: null/undefined plan.groups never throws ---
+
+describe("validateNormalizedPlan — B4: null/undefined groups never throws", () => {
+	test("empty object {} returns structured error, does not throw", () => {
+		const result = validateNormalizedPlan({} as unknown as NormalizedPlan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.errors.some((e) => e.includes("groups"))).toBe(true);
+		}
+	});
+
+	test("{groups: null} returns structured error, does not throw", () => {
+		const result = validateNormalizedPlan({ groups: null } as unknown as NormalizedPlan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.errors.some((e) => e.includes("groups"))).toBe(true);
+		}
+	});
+});
+
+// --- B5: cross-group duplicate logicalId ---
+
+describe("validateNormalizedPlan — B5: duplicate logicalIds rejected", () => {
+	test("two groups with the same logicalId are rejected", () => {
+		const plan = makePlan2();
+		// Give the standalone group the same logicalId as the plan group
+		(plan.groups[0] as unknown as Record<string, unknown>).logicalId = "g2";
+		const result = validateNormalizedPlan(plan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.errors.some((e) => e.includes("Duplicate") && e.includes("g2"))).toBe(true);
+		}
+	});
+});
+
+// --- A2: v1 template enforcement and description >= 50 chars ---
+
+describe("validateNormalizedPlan — A2: plan group feature-only + description >= 50 chars", () => {
+	test("plan group with template 'bug' is rejected in v1", () => {
+		const plan = makePlan2();
+		(plan.groups[1] as unknown as Record<string, unknown>).template = "bug";
+		const result = validateNormalizedPlan(plan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.errors.some((e) => e.includes("template") && e.includes("feature"))).toBe(true);
+		}
+	});
+
+	test("plan group with template 'refactor' is rejected in v1", () => {
+		const plan = makePlan2();
+		(plan.groups[1] as unknown as Record<string, unknown>).template = "refactor";
+		const result = validateNormalizedPlan(plan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.errors.some((e) => e.includes("template"))).toBe(true);
+		}
+	});
+
+	test("plan group description < 50 chars is rejected", () => {
+		const plan = makePlan2();
+		(plan.groups[1] as unknown as Record<string, unknown>).description = "too short";
+		const result = validateNormalizedPlan(plan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.errors.some((e) => e.includes("description") && e.includes("50"))).toBe(true);
+		}
+	});
+
+	test("plan group with exactly 50 char description passes", () => {
+		const plan = makePlan2();
+		(plan.groups[1] as unknown as Record<string, unknown>).description = "A".repeat(50);
+		const result = validateNormalizedPlan(plan);
+		// May fail for other reasons, but NOT for description length
+		const descErr = result.ok
+			? false
+			: (result as { ok: false; errors: string[] }).errors.some(
+					(e) => e.includes("description") && e.includes("50"),
+				);
+		expect(descErr).toBe(false);
+	});
+});
+
+// --- B6: duplicate dependsOn entries rejected ---
+
+describe("validateNormalizedPlan — B6: duplicate dependsOn rejected", () => {
+	test("unit with duplicate dependsOn entry is rejected", () => {
+		const plan = makePlan2();
+		(plan.groups[1] as PlanGroup).units[1]!.dependsOn = ["u1", "u1"];
+		const result = validateNormalizedPlan(plan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.errors.some((e) => e.includes("duplicate"))).toBe(true);
 		}
 	});
 });

@@ -1,11 +1,14 @@
 /**
  * Tests for the manifest module.
- * Tests: classifySource (new/unchanged/changed), hashContent determinism.
+ * Tests: classifySource (new/unchanged/changed), hashContent determinism, B7 corrupt manifest.
  * File I/O is thin and separable from pure functions.
  */
 
-import { describe, expect, test } from "bun:test";
-import { classifySource, hashContent } from "./manifest.ts";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { classifySource, hashContent, loadManifest } from "./manifest.ts";
 import type { IngestionManifest } from "./schema.ts";
 
 // --- hashContent ---
@@ -70,5 +73,44 @@ describe("classifySource", () => {
 	test("path in manifest but different path key → 'new'", () => {
 		const result = classifySource(populatedManifest, "docs/other.md", "sha256:abc123");
 		expect(result).toBe("new");
+	});
+});
+
+// --- B7: corrupt manifest → clear AgentError ---
+
+describe("loadManifest — B7: corrupt JSON throws AgentError with clear message", () => {
+	let tempDir: string;
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "ov-manifest-test-"));
+	});
+
+	afterEach(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	test("corrupt manifest file throws AgentError (not raw SyntaxError)", async () => {
+		const corruptPath = join(tempDir, "corrupt-manifest.json");
+		await writeFile(corruptPath, "{ this is not valid json }", "utf8");
+
+		let thrownError: unknown;
+		try {
+			await loadManifest(corruptPath);
+		} catch (err) {
+			thrownError = err;
+		}
+
+		expect(thrownError).toBeDefined();
+		// Must be an AgentError with a clear message, not a raw SyntaxError
+		const msg = thrownError instanceof Error ? thrownError.message : String(thrownError);
+		expect(msg).toContain("corrupt");
+		expect(msg).toContain("JSON parse");
+	});
+
+	test("non-existent manifest returns empty manifest (not an error)", async () => {
+		const missingPath = join(tempDir, "no-such-manifest.json");
+		const result = await loadManifest(missingPath);
+		expect(result.schemaVersion).toBe(1);
+		expect(result.sources).toEqual({});
 	});
 });

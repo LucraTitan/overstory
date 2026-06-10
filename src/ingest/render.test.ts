@@ -41,7 +41,7 @@ function makePlanWithDeps(): NormalizedPlan {
 				title: "Phase 1 — Auth",
 				type: "feature",
 				priority: 1,
-				description: "Auth system",
+				description: "Auth system implementing login, session management, and JWT token issuance.",
 				acceptance: ["User can log in", "Session persists"],
 				template: "feature",
 				sourceSpan: { start: 100, end: 1000 },
@@ -89,7 +89,8 @@ function makeThreeUnitPlan(): NormalizedPlan {
 				title: "Three unit plan",
 				type: "feature",
 				priority: 1,
-				description: "d",
+				description:
+					"Three unit plan implementing the full data pipeline with fetch, store, and schedule steps.",
 				acceptance: ["a"],
 				template: "feature",
 				sourceSpan: { start: 0, end: 1000 },
@@ -234,6 +235,127 @@ describe("renderOperations — plan group dependsOn → blocks inversion", () =>
 		const planOp = result.operations[1]!;
 		if (planOp.op !== "planSubmit") throw new Error("wrong op");
 		expect(planOp.overwrite).toBe(false);
+	});
+});
+
+// --- A2: context and approach populated ---
+
+describe("renderOperations — A2: context and approach in plan JSON", () => {
+	test("planJson.sections.context equals group description", () => {
+		const plan = makePlanWithDeps();
+		const result = renderOperations(plan, {});
+
+		const planOp = result.operations[1]!;
+		if (planOp.op !== "planSubmit") throw new Error("wrong op");
+		expect(planOp.planJson.sections.context).toBe(
+			"Auth system implementing login, session management, and JWT token issuance.",
+		);
+	});
+
+	test("planJson.sections.approach synthesized from unit titles when group.approach absent", () => {
+		const plan = makePlanWithDeps();
+		const result = renderOperations(plan, {});
+
+		const planOp = result.operations[1]!;
+		if (planOp.op !== "planSubmit") throw new Error("wrong op");
+		expect(planOp.planJson.sections.approach).toBeTruthy();
+		expect(planOp.planJson.sections.approach).toContain("Add login endpoint");
+	});
+
+	test("planJson.sections.approach uses group.approach when present", () => {
+		const plan = makePlanWithDeps();
+		// Add approach to the plan group
+		(plan.groups[0] as unknown as Record<string, unknown>).approach =
+			"Implement login first, then wire up session middleware.";
+		const result = renderOperations(plan, {});
+
+		const planOp = result.operations[1]!;
+		if (planOp.op !== "planSubmit") throw new Error("wrong op");
+		expect(planOp.planJson.sections.approach).toBe(
+			"Implement login first, then wire up session middleware.",
+		);
+	});
+});
+
+// --- B6: blocks deduplication ---
+
+describe("renderOperations — B6: blocks arrays are deduplicated", () => {
+	test("duplicate dependsOn does not produce duplicate blocks entries", () => {
+		// Build a plan where a unit has duplicate dependsOn (which validator rejects,
+		// but renderer should handle defensively)
+		const plan: NormalizedPlan = {
+			schemaVersion: 1,
+			source: { path: "docs/prd.md", contentHash: "sha256:bb" },
+			groups: [
+				{
+					kind: "plan",
+					logicalId: "g1",
+					title: "Dedup test plan",
+					type: "feature",
+					priority: 1,
+					description: "A plan for testing duplicate blocks deduplication in the renderer output.",
+					acceptance: ["a"],
+					template: "feature",
+					sourceSpan: { start: 0, end: 500 },
+					confidence: "high",
+					units: [
+						{
+							logicalId: "u1",
+							title: "U1",
+							type: "task",
+							priority: 2,
+							description: "d",
+							acceptance: ["a"],
+							dependsOn: [],
+							sourceSpan: { start: 0, end: 200 },
+							confidence: "high",
+						},
+						{
+							logicalId: "u2",
+							title: "U2",
+							type: "task",
+							priority: 2,
+							description: "d",
+							acceptance: ["a"],
+							// Duplicate dependsOn — renderer must dedup blocks
+							dependsOn: ["u1", "u1"],
+							sourceSpan: { start: 200, end: 400 },
+							confidence: "high",
+						},
+					],
+				},
+			],
+			ambiguities: [],
+		};
+
+		const result = renderOperations(plan, {});
+		const planOp = result.operations[1]!;
+		if (planOp.op !== "planSubmit") throw new Error("wrong op");
+		const step1 = planOp.planJson.sections.steps[0]!;
+		// Even with duplicate dep, step1.blocks should contain 2 only once
+		const blocks = step1.blocks ?? [];
+		const unique = [...new Set(blocks)];
+		expect(blocks).toEqual(unique);
+	});
+});
+
+// --- B8: standalone adopt preview ---
+
+describe("renderOperations — B8: standalone adopt path emits adopt note", () => {
+	test("when existingSeedId is set, commands shows adopt note not sd create", () => {
+		const plan = makeSimplePlan();
+		const manifestEntry = {
+			logicalId: "g1",
+			kind: "standalone" as const,
+			seedId: "proj-adopt-01",
+		};
+
+		const result = renderOperations(plan, { g1: manifestEntry });
+
+		expect(result.commands).toHaveLength(1);
+		expect(result.commands[0]).toContain("adopt");
+		expect(result.commands[0]).toContain("proj-adopt-01");
+		expect(result.commands[0]).not.toContain("sd create");
 	});
 });
 

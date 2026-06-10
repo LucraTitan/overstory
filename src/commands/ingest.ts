@@ -27,6 +27,7 @@ import { createSeedsPlanClient } from "../tracker/seeds-plan.ts";
 export interface IngestOptions {
 	plan: string; // file path or "-" for stdin
 	apply?: boolean;
+	dryRun?: boolean; // alias for no --apply (contract §3)
 	newPlan?: boolean;
 	manifest?: string;
 	cwd?: string;
@@ -55,7 +56,8 @@ export async function ingestCommand(
 ): Promise<IngestResult> {
 	const cwd = resolve(opts.cwd ?? process.cwd());
 	const manifestPath = opts.manifest ?? join(cwd, ".overstory", "ingestion-manifest.json");
-	const apply = opts.apply ?? false;
+	// B3: --dry-run is an alias for "no --apply"
+	const apply = (opts.apply ?? false) && !(opts.dryRun ?? false);
 	const newPlan = opts.newPlan ?? false;
 	const useJson = opts.json ?? false;
 
@@ -149,41 +151,80 @@ export async function ingestCommand(
 		}
 		const freshPlanInfoMap = new Map<string, PlanInfo>();
 
+		// B1: track completed groups for partial-failure manifest
+		const freshCompletedGroups: NormalizedGroup[] = [];
+
 		let freshOpIndex = 0;
-		for (const group of rawPlan.groups) {
-			if (group.kind === "standalone") {
-				const op = freshOps[freshOpIndex++];
-				if (op === undefined || op.op !== "create") continue;
-				const seedId = await freshClient.executeCreate(op);
-				freshCreated.push(seedId);
-				freshLogicalIdToSeedId.set(group.logicalId, seedId);
-			} else if (group.kind === "plan") {
-				const createOp = freshOps[freshOpIndex++];
-				if (createOp === undefined || createOp.op !== "create") continue;
-				const parentId = await freshClient.executeCreate(createOp);
-				freshCreated.push(parentId);
-				freshLogicalIdToSeedId.set(group.logicalId, parentId);
+		try {
+			for (const group of rawPlan.groups) {
+				if (group.kind === "standalone") {
+					const op = freshOps[freshOpIndex++];
+					if (op === undefined || op.op !== "create") continue;
+					const seedId = await freshClient.executeCreate(op);
+					freshCreated.push(seedId);
+					freshLogicalIdToSeedId.set(group.logicalId, seedId);
+					freshCompletedGroups.push(group);
+				} else if (group.kind === "plan") {
+					const createOp = freshOps[freshOpIndex++];
+					if (createOp === undefined || createOp.op !== "create") continue;
+					const parentId = await freshClient.executeCreate(createOp);
+					freshCreated.push(parentId);
+					freshLogicalIdToSeedId.set(group.logicalId, parentId);
 
-				const submitOp = freshOps[freshOpIndex++];
-				if (submitOp === undefined || submitOp.op !== "planSubmit") continue;
-				const submitResult = await freshClient.executePlanSubmit(parentId, submitOp);
-				freshPlanIds.push(submitResult.planId);
-				freshCreated.push(...submitResult.children);
+					const submitOp = freshOps[freshOpIndex++];
+					if (submitOp === undefined || submitOp.op !== "planSubmit") continue;
+					const submitResult = await freshClient.executePlanSubmit(parentId, submitOp);
+					freshPlanIds.push(submitResult.planId);
+					freshCreated.push(...submitResult.children);
 
-				const unitIdMap = new Map<string, string>();
-				group.units.forEach((unit, i) => {
-					const childId = submitResult.children[i];
-					if (childId !== undefined) {
-						unitIdMap.set(unit.logicalId, childId);
+					// B2: surface obsolete units as warnings
+					for (const obsoleteId of submitResult.obsolete) {
+						warnings.push(`obsolete unit ${obsoleteId} (dropped from plan)`);
 					}
-				});
-				freshPlanInfoMap.set(group.logicalId, {
-					planId: submitResult.planId,
-					children: submitResult.children,
-					obsolete: submitResult.obsolete,
-					unitIds: unitIdMap,
-				});
+
+					const unitIdMap = new Map<string, string>();
+					group.units.forEach((unit, i) => {
+						const childId = submitResult.children[i];
+						if (childId !== undefined) {
+							unitIdMap.set(unit.logicalId, childId);
+						}
+					});
+					freshPlanInfoMap.set(group.logicalId, {
+						planId: submitResult.planId,
+						children: submitResult.children,
+						obsolete: submitResult.obsolete,
+						unitIds: unitIdMap,
+					});
+					freshCompletedGroups.push(group);
+				}
 			}
+		} catch (applyErr: unknown) {
+			// B1: partial failure — write PARTIAL manifest for completed groups, then re-throw
+			if (freshCompletedGroups.length > 0) {
+				const partialIngestedAt = new Date().toISOString();
+				const partialManifest = updateManifest(
+					manifest,
+					sourcePath,
+					sourceHash,
+					partialIngestedAt,
+					freshCompletedGroups,
+					freshLogicalIdToSeedId,
+					freshPlanInfoMap,
+				);
+				try {
+					await saveManifest(manifestPath, partialManifest);
+				} catch {
+					// Best-effort; suppress save error so original error propagates
+				}
+				const partialIds = freshCreated.join(", ");
+				const errMsg = applyErr instanceof Error ? applyErr.message : String(applyErr);
+				throw new Error(
+					`Partial ingest failure after creating [${partialIds}]. ` +
+						`Manifest written for completed groups — re-run to reconcile remaining. ` +
+						`Original error: ${errMsg}`,
+				);
+			}
+			throw applyErr;
 		}
 
 		const freshIngestedAt = new Date().toISOString();
@@ -310,46 +351,85 @@ export async function ingestCommand(
 	}
 	const planInfoMap = new Map<string, PlanInfo>();
 
+	// B1: track completed groups for partial-failure manifest
+	const completedGroups: NormalizedGroup[] = [];
+
 	// Execute operations in order
 	let opIndex = 0;
-	for (const group of rawPlan.groups) {
-		if (group.kind === "standalone") {
-			const op = operations[opIndex++];
-			if (op === undefined || op.op !== "create") continue;
-			const seedId = await client.executeCreate(op);
-			created.push(seedId);
-			logicalIdToSeedId.set(group.logicalId, seedId);
-		} else if (group.kind === "plan") {
-			// Create (parent)
-			const createOp = operations[opIndex++];
-			if (createOp === undefined || createOp.op !== "create") continue;
-			const parentId = await client.executeCreate(createOp);
-			created.push(parentId);
-			logicalIdToSeedId.set(group.logicalId, parentId);
+	try {
+		for (const group of rawPlan.groups) {
+			if (group.kind === "standalone") {
+				const op = operations[opIndex++];
+				if (op === undefined || op.op !== "create") continue;
+				const seedId = await client.executeCreate(op);
+				created.push(seedId);
+				logicalIdToSeedId.set(group.logicalId, seedId);
+				completedGroups.push(group);
+			} else if (group.kind === "plan") {
+				// Create (parent)
+				const createOp = operations[opIndex++];
+				if (createOp === undefined || createOp.op !== "create") continue;
+				const parentId = await client.executeCreate(createOp);
+				created.push(parentId);
+				logicalIdToSeedId.set(group.logicalId, parentId);
 
-			// planSubmit
-			const submitOp = operations[opIndex++];
-			if (submitOp === undefined || submitOp.op !== "planSubmit") continue;
-			const submitResult = await client.executePlanSubmit(parentId, submitOp);
-			planIds.push(submitResult.planId);
-			created.push(...submitResult.children);
+				// planSubmit
+				const submitOp = operations[opIndex++];
+				if (submitOp === undefined || submitOp.op !== "planSubmit") continue;
+				const submitResult = await client.executePlanSubmit(parentId, submitOp);
+				planIds.push(submitResult.planId);
+				created.push(...submitResult.children);
 
-			// Map children back to units by step order
-			const unitIdMap = new Map<string, string>();
-			group.units.forEach((unit, i) => {
-				const childId = submitResult.children[i];
-				if (childId !== undefined) {
-					unitIdMap.set(unit.logicalId, childId);
+				// B2: surface obsolete units as warnings
+				for (const obsoleteId of submitResult.obsolete) {
+					warnings.push(`obsolete unit ${obsoleteId} (dropped from plan)`);
 				}
-			});
 
-			planInfoMap.set(group.logicalId, {
-				planId: submitResult.planId,
-				children: submitResult.children,
-				obsolete: submitResult.obsolete,
-				unitIds: unitIdMap,
-			});
+				// Map children back to units by step order
+				const unitIdMap = new Map<string, string>();
+				group.units.forEach((unit, i) => {
+					const childId = submitResult.children[i];
+					if (childId !== undefined) {
+						unitIdMap.set(unit.logicalId, childId);
+					}
+				});
+
+				planInfoMap.set(group.logicalId, {
+					planId: submitResult.planId,
+					children: submitResult.children,
+					obsolete: submitResult.obsolete,
+					unitIds: unitIdMap,
+				});
+				completedGroups.push(group);
+			}
 		}
+	} catch (applyErr: unknown) {
+		// B1: partial failure — write PARTIAL manifest for completed groups, then re-throw
+		if (completedGroups.length > 0) {
+			const partialIngestedAt = new Date().toISOString();
+			const partialManifest = updateManifest(
+				manifest,
+				sourcePath,
+				sourceHash,
+				partialIngestedAt,
+				completedGroups,
+				logicalIdToSeedId,
+				planInfoMap,
+			);
+			try {
+				await saveManifest(manifestPath, partialManifest);
+			} catch {
+				// Best-effort; suppress save error so original error propagates
+			}
+			const partialIds = created.join(", ");
+			const errMsg = applyErr instanceof Error ? applyErr.message : String(applyErr);
+			throw new Error(
+				`Partial ingest failure after creating [${partialIds}]. ` +
+					`Manifest written for completed groups — re-run to reconcile remaining. ` +
+					`Original error: ${errMsg}`,
+			);
+		}
+		throw applyErr;
 	}
 
 	// Write manifest
@@ -523,6 +603,7 @@ export function createIngestCommand(): Command {
 		.description("Ingest a normalized-plan JSON and create/reconcile seeds via sd")
 		.requiredOption("--plan <file|->", "Normalized-plan JSON file, or '-' to read from stdin")
 		.option("--apply", "Actually write seeds (create/reconcile). Omit for dry-run preview.")
+		.option("--dry-run", "Explicit alias for 'no --apply' (preview only, writes nothing).")
 		.option(
 			"--new-plan",
 			"Force fresh creation even if the source is already in the manifest (duplicates ready work)",

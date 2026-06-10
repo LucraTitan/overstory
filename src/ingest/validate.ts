@@ -10,7 +10,6 @@ import type { NormalizedGroup, NormalizedPlan, PlanGroup, StandaloneGroup } from
 
 const VALID_KINDS = new Set(["standalone", "plan"]);
 const VALID_TYPES = new Set(["task", "bug", "feature", "epic"]);
-const VALID_TEMPLATES = new Set(["feature", "bug", "refactor"]);
 const VALID_CONFIDENCE = new Set(["high", "low"]);
 
 export type ValidationResult = { ok: true; errors: [] } | { ok: false; errors: string[] };
@@ -20,6 +19,44 @@ export type ValidationResult = { ok: true; errors: [] } | { ok: false; errors: s
  */
 export function validateNormalizedPlan(plan: NormalizedPlan): ValidationResult {
 	const errors: string[] = [];
+
+	// B4: null/undefined plan.groups guard — never throw
+	if (!Array.isArray(plan.groups)) {
+		errors.push("plan.groups must be an array");
+		return { ok: false, errors };
+	}
+
+	// B5: cross-group duplicate logicalId check (groups + units all unique)
+	const allGroupIds = new Set<string>();
+	const allUnitIds = new Set<string>();
+	for (const group of plan.groups) {
+		const gRec = group as unknown as Record<string, unknown>;
+		const gId = gRec.logicalId as string | undefined;
+		if (gId !== undefined) {
+			if (allGroupIds.has(gId)) {
+				errors.push(
+					`Duplicate group logicalId '${gId}' — logicalIds must be unique across the whole plan`,
+				);
+			}
+			allGroupIds.add(gId);
+		}
+		if (
+			(group as { kind?: unknown }).kind === "plan" &&
+			Array.isArray((group as { units?: unknown }).units)
+		) {
+			for (const unit of (group as { units: Array<{ logicalId?: string }> }).units) {
+				const uId = unit.logicalId;
+				if (uId !== undefined) {
+					if (allUnitIds.has(uId)) {
+						errors.push(
+							`Duplicate unit logicalId '${uId}' — logicalIds must be unique across the whole plan`,
+						);
+					}
+					allUnitIds.add(uId);
+				}
+			}
+		}
+	}
 
 	for (const group of plan.groups) {
 		validateGroup(group, errors);
@@ -72,10 +109,17 @@ function validateCommonFields(
 }
 
 function validatePlanGroup(group: PlanGroup, prefix: string, errors: string[]): void {
-	// Template required for plan groups
-	if (!group.template || !VALID_TEMPLATES.has(group.template)) {
+	// Template required for plan groups — v1: feature ONLY
+	if (group.template !== "feature") {
 		errors.push(
-			`${prefix} plan group requires a valid template (feature|bug|refactor), got '${String(group.template)}'`,
+			`${prefix} plan group template must be 'feature' in v1 (got '${String(group.template)}'). Bug/refactor plan templates are v2; a bug-type item should be a standalone seed.`,
+		);
+	}
+
+	// description must be >= 50 chars (becomes sd sections.context)
+	if (!group.description || group.description.trim().length < 50) {
+		errors.push(
+			`${prefix} plan group description must be >= 50 characters (it becomes sd sections.context); got ${group.description?.length ?? 0} chars`,
 		);
 	}
 
@@ -113,7 +157,8 @@ function validatePlanGroup(group: PlanGroup, prefix: string, errors: string[]): 
 			errors.push(`${unitPrefix} priority must be 0..4`);
 		}
 
-		// dependsOn validation
+		// dependsOn validation: no self-edges, no cross-group, no duplicates
+		const seenDeps = new Set<string>();
 		for (const dep of unit.dependsOn) {
 			// Self-edge
 			if (dep === unit.logicalId) {
@@ -125,7 +170,14 @@ function validatePlanGroup(group: PlanGroup, prefix: string, errors: string[]): 
 				errors.push(
 					`${unitPrefix} dependsOn '${dep}' is not a sibling unit in this plan (cross-group deps are v2)`,
 				);
+				continue;
 			}
+			// Duplicate dependsOn entry
+			if (seenDeps.has(dep)) {
+				errors.push(`${unitPrefix} duplicate dependsOn entry '${dep}'`);
+				continue;
+			}
+			seenDeps.add(dep);
 		}
 	}
 

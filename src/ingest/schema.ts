@@ -48,9 +48,10 @@ export interface PlanGroup {
 	title: string;
 	type: "task" | "bug" | "feature" | "epic";
 	priority: 0 | 1 | 2 | 3 | 4;
-	description: string;
+	description: string; // becomes sd sections.context; MUST be >= 50 chars
 	acceptance: string[];
-	template: "feature" | "bug" | "refactor";
+	template: "feature"; // v1: feature ONLY (bug/refactor require reproduction+root_cause which can't be synthesized)
+	approach?: string; // → sd sections.approach; if absent/empty, renderer synthesizes fallback
 	sourceSpan: SourceSpan;
 	confidence: Confidence;
 	units: NormalizedUnit[]; // min 2 required

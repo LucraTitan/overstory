@@ -8,6 +8,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { AgentError } from "../errors.ts";
 import type { IngestionManifest } from "./schema.ts";
 
 export type SourceClassification = "new" | "unchanged" | "changed";
@@ -37,11 +38,12 @@ export function classifySource(
 
 /**
  * Load manifest from disk. Returns an empty manifest if the file doesn't exist.
+ * B7: wraps JSON parse failure in an AgentError with a clear message.
  */
 export async function loadManifest(manifestPath: string): Promise<IngestionManifest> {
+	let raw: string;
 	try {
-		const raw = await readFile(manifestPath, "utf8");
-		return JSON.parse(raw) as IngestionManifest;
+		raw = await readFile(manifestPath, "utf8");
 	} catch (err: unknown) {
 		// ENOENT → fresh manifest
 		if (
@@ -53,6 +55,17 @@ export async function loadManifest(manifestPath: string): Promise<IngestionManif
 			return { schemaVersion: 1, sources: {} };
 		}
 		throw err;
+	}
+
+	try {
+		return JSON.parse(raw) as IngestionManifest;
+	} catch (err: unknown) {
+		// B7: corrupt manifest — throw a clear AgentError instead of a raw SyntaxError stack trace
+		const detail = err instanceof SyntaxError ? err.message : String(err);
+		throw new AgentError(
+			`Manifest at '${manifestPath}' is corrupt (JSON parse failed): ${detail}. ` +
+				"Delete or repair the manifest file before re-running.",
+		);
 	}
 }
 

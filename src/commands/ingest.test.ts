@@ -45,7 +45,8 @@ const VALID_PLAN_WITH_UNITS: NormalizedPlan = {
 			title: "Auth System",
 			type: "feature",
 			priority: 1,
-			description: "Full auth",
+			description:
+				"Full authentication system implementing login endpoint, session middleware, and JWT tokens.",
 			acceptance: ["Login works"],
 			template: "feature",
 			sourceSpan: { start: 0, end: 500 },
@@ -484,6 +485,170 @@ describe("ingestCommand — apply", () => {
 		// The parent seed id from create call is forwarded to planSubmit
 		const parentId = tracker.planSubmitCalls[0]?.parentId ?? "";
 		expect(parentId.length).toBeGreaterThan(0);
+	});
+});
+
+describe("ingestCommand — B1: partial failure writes partial manifest", () => {
+	test("mid-loop sd failure writes partial manifest with completed groups and re-throws", async () => {
+		const planPath = await writePlanFile({
+			schemaVersion: 1,
+			source: { path: "docs/partial.md", contentHash: "sha256:partial111" },
+			groups: [
+				{
+					kind: "standalone",
+					logicalId: "g1",
+					title: "Group 1",
+					type: "task",
+					priority: 2,
+					description: "First group that succeeds",
+					acceptance: [],
+					sourceSpan: { start: 0, end: 100 },
+					confidence: "high",
+				},
+				{
+					kind: "standalone",
+					logicalId: "g2",
+					title: "Group 2",
+					type: "task",
+					priority: 2,
+					description: "Second group that fails during apply",
+					acceptance: [],
+					sourceSpan: { start: 100, end: 200 },
+					confidence: "high",
+				},
+			],
+			ambiguities: [],
+		});
+
+		await ensureOvDir();
+		const manifestPath = join(tempDir, ".overstory", "ingestion-manifest.json");
+
+		// Inject a client that succeeds for g1 but throws on g2
+		let callCount = 0;
+		const failingClient: SeedsPlanClient = {
+			async executeCreate(_op: CreateOp): Promise<string> {
+				callCount++;
+				if (callCount >= 2) {
+					throw new Error("sd create failed: simulated failure");
+				}
+				return `proj-partial-${String(callCount).padStart(4, "0")}`;
+			},
+			async executePlanSubmit(_parentId: string, _op: PlanSubmitOp): Promise<PlanSubmitResult> {
+				throw new Error("should not be called");
+			},
+		};
+
+		let threw = false;
+		try {
+			await ingestCommand(
+				{
+					plan: planPath,
+					apply: true,
+					newPlan: false,
+					manifest: manifestPath,
+					cwd: tempDir,
+					json: false,
+				},
+				failingClient,
+			);
+		} catch {
+			threw = true;
+		}
+
+		expect(threw).toBe(true); // must re-throw
+
+		// Partial manifest must be written with the completed group (g1)
+		const { readFile: rf } = await import("node:fs/promises");
+		const manifestContent = await rf(manifestPath, "utf8");
+		const manifest = JSON.parse(manifestContent) as {
+			sources: Record<string, { groups: Array<{ logicalId: string }> }>;
+		};
+		const groups = manifest.sources["docs/partial.md"]?.groups ?? [];
+		const completedLogicalIds = groups.map((g) => g.logicalId);
+		expect(completedLogicalIds).toContain("g1");
+		expect(completedLogicalIds).not.toContain("g2"); // g2 failed, not recorded
+	});
+});
+
+describe("ingestCommand — B2: obsolete units appear in warnings", () => {
+	test("plan-submit obsolete ids surface as warnings in result", async () => {
+		const planPath = await writePlanFile(VALID_PLAN_WITH_UNITS);
+		await ensureOvDir();
+		const manifestPath = join(tempDir, ".overstory", "ingestion-manifest.json");
+
+		const obsoleteClient: SeedsPlanClient = {
+			async executeCreate(_op: CreateOp): Promise<string> {
+				return "proj-obs-0001";
+			},
+			async executePlanSubmit(_parentId: string, _op: PlanSubmitOp): Promise<PlanSubmitResult> {
+				return {
+					planId: "pl-obs-0001",
+					children: ["proj-child-0001", "proj-child-0002"],
+					obsolete: ["proj-old-dropped-0001"], // simulate a dropped unit
+				};
+			},
+		};
+
+		const result = await ingestCommand(
+			{
+				plan: planPath,
+				apply: true,
+				newPlan: false,
+				manifest: manifestPath,
+				cwd: tempDir,
+				json: false,
+			},
+			obsoleteClient,
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(
+			result.warnings.some((w) => w.includes("obsolete") && w.includes("proj-old-dropped-0001")),
+		).toBe(true);
+	});
+});
+
+describe("ingestCommand — B3: --dry-run is a preview alias", () => {
+	test("--dry-run produces preview (exit 0) and does not call sd even with --apply", async () => {
+		const planPath = await writePlanFile(VALID_STANDALONE_PLAN);
+		const tracker: FakeClientTracker = { createCalls: [], planSubmitCalls: [] };
+
+		const result = await ingestCommand(
+			{
+				plan: planPath,
+				apply: true, // --apply is set but --dry-run overrides it
+				dryRun: true,
+				newPlan: false,
+				cwd: tempDir,
+				json: false,
+			},
+			makeFakeClient(tracker),
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(result.mode).toBe("preview");
+		expect(tracker.createCalls).toHaveLength(0);
+	});
+
+	test("--dry-run without --apply also produces preview, exit 0", async () => {
+		const planPath = await writePlanFile(VALID_STANDALONE_PLAN);
+		const tracker: FakeClientTracker = { createCalls: [], planSubmitCalls: [] };
+
+		const result = await ingestCommand(
+			{
+				plan: planPath,
+				apply: false,
+				dryRun: true,
+				newPlan: false,
+				cwd: tempDir,
+				json: false,
+			},
+			makeFakeClient(tracker),
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(tracker.createCalls).toHaveLength(0);
+		expect(result.commands.length).toBeGreaterThan(0);
 	});
 });
 

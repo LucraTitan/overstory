@@ -11,6 +11,7 @@ import type {
 	NormalizedGroup,
 	NormalizedPlan,
 	NormalizedUnit,
+	PlanGroup,
 } from "./schema.ts";
 
 // --- Operation types ---
@@ -95,7 +96,12 @@ function renderGroup(
 			args,
 			...(existingSeedId !== undefined ? { existingSeedId } : {}),
 		});
-		commands.push(`sd ${args.join(" ")}`);
+		// B8: when reconciling (adopt path), emit an adopt note instead of a sd create command
+		if (existingSeedId !== undefined) {
+			commands.push(`# adopt existing seed ${existingSeedId} (no sd call)`);
+		} else {
+			commands.push(`sd ${args.join(" ")}`);
+		}
 	} else if (group.kind === "plan") {
 		const planManifest = manifestEntry?.kind === "plan" ? manifestEntry : undefined;
 		const existingSeedId = planManifest?.seedId;
@@ -108,14 +114,21 @@ function renderGroup(
 			args: createArgs,
 			...(existingSeedId !== undefined ? { existingSeedId } : {}),
 		});
-		commands.push(`sd ${createArgs.join(" ")}`);
+		if (existingSeedId !== undefined) {
+			commands.push(`# adopt existing parent seed ${existingSeedId} (no sd call)`);
+		} else {
+			commands.push(`sd ${createArgs.join(" ")}`);
+		}
 
 		// Build steps with dependsOn → blocks inversion
 		const steps = buildSteps(group.units, planManifest);
 
+		// A2: populate context and approach for sd feature plan
 		const planJson: SdPlanJson = {
 			template: group.template,
 			sections: {
+				context: group.description,
+				approach: resolveApproach(group),
 				steps,
 				acceptance: group.acceptance,
 			},
@@ -132,6 +145,17 @@ function renderGroup(
 		const overwriteFlag = overwrite ? " --overwrite" : "";
 		commands.push(`sd plan submit <parentId> --plan -${overwriteFlag} --json`);
 	}
+}
+
+/**
+ * Resolve the approach for a plan group's sd plan JSON.
+ * Uses group.approach if non-empty; otherwise synthesizes from unit titles.
+ */
+function resolveApproach(group: PlanGroup): string {
+	if (group.approach && group.approach.trim() !== "") {
+		return group.approach.trim();
+	}
+	return `Implement: ${group.units.map((u) => u.title).join("; ")}`;
 }
 
 function buildCreateArgs(
@@ -205,6 +229,13 @@ function buildSteps(
 			}
 		}
 	});
+
+	// B6: defensively dedup blocks arrays (in case of duplicate dependsOn entries)
+	for (const step of steps) {
+		if (step.blocks !== undefined) {
+			step.blocks = [...new Set(step.blocks)];
+		}
+	}
 
 	return steps;
 }
