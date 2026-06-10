@@ -151,8 +151,8 @@ export async function ingestCommand(
 		}
 		const freshPlanInfoMap = new Map<string, PlanInfo>();
 
-		// B1: track completed groups for partial-failure manifest
-		const freshCompletedGroups: NormalizedGroup[] = [];
+		// FIX 1: track started groups for partial-failure manifest (same atomicity fix as main loop).
+		const freshStartedGroups: NormalizedGroup[] = [];
 
 		let freshOpIndex = 0;
 		try {
@@ -163,7 +163,7 @@ export async function ingestCommand(
 					const seedId = await freshClient.executeCreate(op);
 					freshCreated.push(seedId);
 					freshLogicalIdToSeedId.set(group.logicalId, seedId);
-					freshCompletedGroups.push(group);
+					freshStartedGroups.push(group);
 				} else if (group.kind === "plan") {
 					const createOp = freshOps[freshOpIndex++];
 					if (createOp === undefined || createOp.op !== "create") continue;
@@ -171,10 +171,11 @@ export async function ingestCommand(
 					freshCreated.push(parentId);
 					freshLogicalIdToSeedId.set(group.logicalId, parentId);
 
-					// KNOWN LIMITATION (v1): if executeCreate above SUCCEEDS but executePlanSubmit
-					// below FAILS, this group is NOT added to freshCompletedGroups, so on re-run a
-					// NEW parent seed is created — producing a duplicate orphan parent.
-					// Fully solving this requires recording the orphan parentId; deferred to v2.
+					// FIX 1: record parent in startedGroups IMMEDIATELY after create succeeds, before
+					// plan submit. If plan submit then fails, the partial manifest records the seedId
+					// so a re-run can ADOPT the parent (no duplicate orphan).
+					freshStartedGroups.push(group);
+
 					const submitOp = freshOps[freshOpIndex++];
 					if (submitOp === undefined || submitOp.op !== "planSubmit") continue;
 					const submitResult = await freshClient.executePlanSubmit(parentId, submitOp);
@@ -199,20 +200,19 @@ export async function ingestCommand(
 						obsolete: submitResult.obsolete,
 						unitIds: unitIdMap,
 					});
-					freshCompletedGroups.push(group);
 				}
 			}
 		} catch (applyErr: unknown) {
-			// B1: partial failure — write PARTIAL manifest for completed groups, then re-throw.
+			// B1: partial failure — write PARTIAL manifest for started groups, then re-throw.
 			// partial:true ensures a re-run classifies as "changed" and reconciles (never no-ops).
-			if (freshCompletedGroups.length > 0) {
+			if (freshStartedGroups.length > 0) {
 				const partialIngestedAt = new Date().toISOString();
 				const partialManifest = updateManifest(
 					manifest,
 					sourcePath,
 					sourceHash,
 					partialIngestedAt,
-					freshCompletedGroups,
+					freshStartedGroups,
 					freshLogicalIdToSeedId,
 					freshPlanInfoMap,
 					true, // partial — forces reconcile on re-run
@@ -226,7 +226,7 @@ export async function ingestCommand(
 				const errMsg = applyErr instanceof Error ? applyErr.message : String(applyErr);
 				throw new Error(
 					`Partial ingest failure after creating [${partialIds}]. ` +
-						`Manifest written for completed groups — re-run to reconcile remaining. ` +
+						`Manifest written for started groups — re-run to reconcile remaining. ` +
 						`Original error: ${errMsg}`,
 				);
 			}
@@ -357,8 +357,12 @@ export async function ingestCommand(
 	}
 	const planInfoMap = new Map<string, PlanInfo>();
 
-	// B1: track completed groups for partial-failure manifest
-	const completedGroups: NormalizedGroup[] = [];
+	// FIX 1: track started groups (includes plan groups whose parent was created but submit
+	// hasn't completed yet). This is the set we write to the partial manifest on failure.
+	// A plan group is added to startedGroups the moment its parent sd create succeeds, so if
+	// plan submit then fails, the partial manifest records the parent seedId (pending entry,
+	// no planId) and a re-run can ADOPT the existing parent rather than creating a duplicate.
+	const startedGroups: NormalizedGroup[] = [];
 
 	// Execute operations in order
 	let opIndex = 0;
@@ -370,7 +374,7 @@ export async function ingestCommand(
 				const seedId = await client.executeCreate(op);
 				created.push(seedId);
 				logicalIdToSeedId.set(group.logicalId, seedId);
-				completedGroups.push(group);
+				startedGroups.push(group);
 			} else if (group.kind === "plan") {
 				// Create (parent)
 				const createOp = operations[opIndex++];
@@ -379,11 +383,11 @@ export async function ingestCommand(
 				created.push(parentId);
 				logicalIdToSeedId.set(group.logicalId, parentId);
 
-				// planSubmit
-				// KNOWN LIMITATION (v1): if executeCreate above SUCCEEDS but executePlanSubmit below
-				// FAILS, this group is NOT added to completedGroups, so on re-run it is treated as
-				// missing and a NEW parent seed is created — producing a duplicate orphan parent.
-				// Fully solving this requires recording the orphan parentId; deferred to v2.
+				// FIX 1: record parent in startedGroups IMMEDIATELY after create succeeds, before
+				// plan submit. If plan submit then fails, the partial manifest includes a pending
+				// entry with seedId (no planId), so a re-run adopts the parent (no duplicate).
+				startedGroups.push(group);
+
 				const submitOp = operations[opIndex++];
 				if (submitOp === undefined || submitOp.op !== "planSubmit") continue;
 				const submitResult = await client.executePlanSubmit(parentId, submitOp);
@@ -410,20 +414,21 @@ export async function ingestCommand(
 					obsolete: submitResult.obsolete,
 					unitIds: unitIdMap,
 				});
-				completedGroups.push(group);
 			}
 		}
 	} catch (applyErr: unknown) {
-		// B1: partial failure — write PARTIAL manifest for completed groups, then re-throw.
+		// B1: partial failure — write PARTIAL manifest for started groups, then re-throw.
 		// partial:true ensures a re-run classifies as "changed" and reconciles (never no-ops).
-		if (completedGroups.length > 0) {
+		// Plan groups whose parent was created but submit failed get a pending manifest entry
+		// (seedId, no planId) so re-runs adopt the parent instead of creating a duplicate.
+		if (startedGroups.length > 0) {
 			const partialIngestedAt = new Date().toISOString();
 			const partialManifest = updateManifest(
 				manifest,
 				sourcePath,
 				sourceHash,
 				partialIngestedAt,
-				completedGroups,
+				startedGroups,
 				logicalIdToSeedId,
 				planInfoMap,
 				true, // partial — forces reconcile on re-run
@@ -437,7 +442,7 @@ export async function ingestCommand(
 			const errMsg = applyErr instanceof Error ? applyErr.message : String(applyErr);
 			throw new Error(
 				`Partial ingest failure after creating [${partialIds}]. ` +
-					`Manifest written for completed groups — re-run to reconcile remaining. ` +
+					`Manifest written for started groups — re-run to reconcile remaining. ` +
 					`Original error: ${errMsg}`,
 			);
 		}
@@ -550,22 +555,35 @@ function updateManifest(
 			newGroups.push(entry);
 		} else if (group.kind === "plan") {
 			const seedId = logicalIdToSeedId.get(group.logicalId);
+			// seedId is required; planInfo may be absent for a pending entry (parent created
+			// but plan submit failed). We still emit the entry so re-runs can adopt the parent.
+			if (seedId === undefined) continue;
+
 			const planInfo = planInfoMap.get(group.logicalId);
-			if (seedId === undefined || planInfo === undefined) continue;
-
-			const units: Record<string, string> = {};
-			for (const [lid, sid] of planInfo.unitIds) {
-				units[lid] = sid;
+			if (planInfo === undefined) {
+				// Pending plan entry: parent seed exists but plan submit hasn't run yet.
+				// Record seedId only so the reconcile path can adopt the parent on re-run.
+				const entry: ManifestPlanEntry = {
+					logicalId: group.logicalId,
+					kind: "plan",
+					seedId,
+					units: {},
+				};
+				newGroups.push(entry);
+			} else {
+				const units: Record<string, string> = {};
+				for (const [lid, sid] of planInfo.unitIds) {
+					units[lid] = sid;
+				}
+				const entry: ManifestPlanEntry = {
+					logicalId: group.logicalId,
+					kind: "plan",
+					seedId,
+					planId: planInfo.planId,
+					units,
+				};
+				newGroups.push(entry);
 			}
-
-			const entry: ManifestPlanEntry = {
-				logicalId: group.logicalId,
-				kind: "plan",
-				seedId,
-				planId: planInfo.planId,
-				units,
-			};
-			newGroups.push(entry);
 		}
 	}
 

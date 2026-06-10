@@ -90,7 +90,13 @@ export interface ManifestPlanEntry {
 	logicalId: string;
 	kind: "plan";
 	seedId: string; // parent seed id
-	planId: string;
+	/**
+	 * Present once sd plan submit has succeeded. Absent (pending) when the parent seed was
+	 * created but plan submit failed mid-apply — the partial manifest records the seedId so a
+	 * re-run can ADOPT the existing parent and retry the submit (no duplicate orphan parent).
+	 */
+	planId?: string;
+	/** logicalId → seedId map. Empty / absent on a pending entry (plan submit not yet done). */
 	units: Record<string, string>; // logicalId → seedId
 }
 

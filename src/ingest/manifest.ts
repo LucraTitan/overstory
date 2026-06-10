@@ -62,8 +62,9 @@ export async function loadManifest(manifestPath: string): Promise<IngestionManif
 		throw err;
 	}
 
+	let parsed: unknown;
 	try {
-		return JSON.parse(raw) as IngestionManifest;
+		parsed = JSON.parse(raw);
 	} catch (err: unknown) {
 		// B7: corrupt manifest — throw a clear AgentError instead of a raw SyntaxError stack trace
 		const detail = err instanceof SyntaxError ? err.message : String(err);
@@ -72,6 +73,24 @@ export async function loadManifest(manifestPath: string): Promise<IngestionManif
 				"Delete or repair the manifest file before re-running.",
 		);
 	}
+
+	// FIX 3: shape validation — valid JSON but wrong shape crashes later at manifest.sources[path].
+	// Validate required fields; throw AgentError with a clear message instead of a late TypeError.
+	if (
+		typeof parsed !== "object" ||
+		parsed === null ||
+		!("schemaVersion" in (parsed as object)) ||
+		typeof (parsed as Record<string, unknown>).sources !== "object" ||
+		(parsed as Record<string, unknown>).sources === null ||
+		Array.isArray((parsed as Record<string, unknown>).sources)
+	) {
+		throw new AgentError(
+			`Manifest at '${manifestPath}' has an invalid shape (expected {schemaVersion, sources: {...}}). ` +
+				"Delete or repair the manifest file before re-running.",
+		);
+	}
+
+	return parsed as IngestionManifest;
 }
 
 /**

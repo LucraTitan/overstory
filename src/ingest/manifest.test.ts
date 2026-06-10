@@ -109,6 +109,86 @@ describe("classifySource", () => {
 	});
 });
 
+// --- FIX 3: wrong-shape manifest → AgentError (not late TypeError) ---
+
+describe("loadManifest — FIX 3: wrong-shape manifest throws AgentError", () => {
+	let tempDir: string;
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "ov-manifest-shape-test-"));
+	});
+
+	afterEach(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	test('valid JSON but wrong shape {"foo":1} → AgentError with clear message', async () => {
+		const shapePath = join(tempDir, "wrong-shape.json");
+		await writeFile(shapePath, JSON.stringify({ foo: 1 }), "utf8");
+
+		let thrownError: unknown;
+		try {
+			await loadManifest(shapePath);
+		} catch (err) {
+			thrownError = err;
+		}
+
+		expect(thrownError).toBeDefined();
+		const msg = thrownError instanceof Error ? thrownError.message : String(thrownError);
+		expect(msg).toContain("invalid shape");
+		// Must NOT be a raw TypeError (the "late crash" path)
+		expect(thrownError?.constructor?.name).not.toBe("TypeError");
+	});
+
+	test("valid JSON but null → AgentError", async () => {
+		const nullPath = join(tempDir, "null.json");
+		await writeFile(nullPath, "null", "utf8");
+
+		let thrownError: unknown;
+		try {
+			await loadManifest(nullPath);
+		} catch (err) {
+			thrownError = err;
+		}
+
+		expect(thrownError).toBeDefined();
+		const msg = thrownError instanceof Error ? thrownError.message : String(thrownError);
+		expect(msg).toContain("invalid shape");
+	});
+
+	test("valid JSON with sources as array (wrong type) → AgentError", async () => {
+		const arrPath = join(tempDir, "array-sources.json");
+		await writeFile(arrPath, JSON.stringify({ schemaVersion: 1, sources: [] }), "utf8");
+
+		let thrownError: unknown;
+		try {
+			await loadManifest(arrPath);
+		} catch (err) {
+			thrownError = err;
+		}
+
+		expect(thrownError).toBeDefined();
+		const msg = thrownError instanceof Error ? thrownError.message : String(thrownError);
+		expect(msg).toContain("invalid shape");
+	});
+
+	test("missing file still returns empty manifest (FIX 3 does not regress ENOENT handling)", async () => {
+		const result = await loadManifest(join(tempDir, "does-not-exist.json"));
+		expect(result.schemaVersion).toBe(1);
+		expect(result.sources).toEqual({});
+	});
+
+	test("valid manifest shape passes without throwing", async () => {
+		const validPath = join(tempDir, "valid.json");
+		const validManifest = { schemaVersion: 1, sources: {} };
+		await writeFile(validPath, JSON.stringify(validManifest), "utf8");
+
+		const result = await loadManifest(validPath);
+		expect(result.schemaVersion).toBe(1);
+		expect(result.sources).toEqual({});
+	});
+});
+
 // --- B7: corrupt manifest → clear AgentError ---
 
 describe("loadManifest — B7: corrupt JSON throws AgentError with clear message", () => {

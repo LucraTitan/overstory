@@ -16,9 +16,19 @@ import { ingestCommand } from "./ingest.ts";
 
 // --- fixtures ---
 
+/** Valid 64-char hex hash constants for test fixtures. */
+const H1 = "sha256:" + "a".repeat(64);
+const H2 = "sha256:" + "b".repeat(64);
+const H3 = "sha256:" + "c".repeat(64);
+const H4 = "sha256:" + "d".repeat(64);
+const H5 = "sha256:" + "e".repeat(64);
+const H6 = "sha256:" + "f".repeat(64);
+const H7 = "sha256:0" + "1".repeat(63);
+const H8 = "sha256:0" + "2".repeat(63);
+
 const VALID_STANDALONE_PLAN: NormalizedPlan = {
 	schemaVersion: 1,
-	source: { path: "docs/prd.md", contentHash: "sha256:aabbcc" },
+	source: { path: "docs/prd.md", contentHash: H1 },
 	groups: [
 		{
 			kind: "standalone",
@@ -37,7 +47,7 @@ const VALID_STANDALONE_PLAN: NormalizedPlan = {
 
 const VALID_PLAN_WITH_UNITS: NormalizedPlan = {
 	schemaVersion: 1,
-	source: { path: "docs/auth.md", contentHash: "sha256:def456" },
+	source: { path: "docs/auth.md", contentHash: H2 },
 	groups: [
 		{
 			kind: "plan",
@@ -215,7 +225,7 @@ describe("ingestCommand — preview (no --apply)", () => {
 		// Modify plan (different hash)
 		const changedPlan: NormalizedPlan = {
 			...VALID_STANDALONE_PLAN,
-			source: { ...VALID_STANDALONE_PLAN.source, contentHash: "sha256:changed999" },
+			source: { ...VALID_STANDALONE_PLAN.source, contentHash: H3 },
 		};
 		const changedPlanPath = join(tempDir, "changed-plan.json");
 		await writeFile(changedPlanPath, JSON.stringify(changedPlan), "utf8");
@@ -332,7 +342,7 @@ describe("ingestCommand — preview (no --apply)", () => {
 		// Changed + --new-plan preview
 		const changedPlan: NormalizedPlan = {
 			...VALID_STANDALONE_PLAN,
-			source: { ...VALID_STANDALONE_PLAN.source, contentHash: "sha256:changed888" },
+			source: { ...VALID_STANDALONE_PLAN.source, contentHash: H4 },
 		};
 		const changedPath = join(tempDir, "changed2.json");
 		await writeFile(changedPath, JSON.stringify(changedPlan), "utf8");
@@ -437,7 +447,7 @@ describe("ingestCommand — apply", () => {
 		// Changed plan (different hash)
 		const changedPlan: NormalizedPlan = {
 			...VALID_PLAN_WITH_UNITS,
-			source: { ...VALID_PLAN_WITH_UNITS.source, contentHash: "sha256:updated111" },
+			source: { ...VALID_PLAN_WITH_UNITS.source, contentHash: H5 },
 		};
 		const changedPath = join(tempDir, "changed-plan.json");
 		await writeFile(changedPath, JSON.stringify(changedPlan), "utf8");
@@ -492,7 +502,7 @@ describe("ingestCommand — B1: partial failure writes partial manifest", () => 
 	test("mid-loop sd failure writes partial manifest with completed groups and re-throws", async () => {
 		const planPath = await writePlanFile({
 			schemaVersion: 1,
-			source: { path: "docs/partial.md", contentHash: "sha256:partial111" },
+			source: { path: "docs/partial.md", contentHash: H6 },
 			groups: [
 				{
 					kind: "standalone",
@@ -576,7 +586,7 @@ describe("ingestCommand — B1: partial failure writes partial manifest", () => 
 describe("ingestCommand — partial-failure regression: re-run reconciles, no silent drop, no duplicate", () => {
 	const TWO_GROUP_PLAN: NormalizedPlan = {
 		schemaVersion: 1,
-		source: { path: "docs/reconcile.md", contentHash: "sha256:reconcile111" },
+		source: { path: "docs/reconcile.md", contentHash: H7 },
 		groups: [
 			{
 				kind: "standalone",
@@ -708,7 +718,7 @@ describe("ingestCommand — partial-failure regression: re-run reconciles, no si
 		};
 		const finalEntry = finalRaw.sources["docs/reconcile.md"];
 		expect(finalEntry?.partial).toBeUndefined(); // cleared on successful reconcile
-		expect(finalEntry?.contentHash).toBe("sha256:reconcile111");
+		expect(finalEntry?.contentHash).toBe(H7);
 		expect(finalEntry?.groups.map((g) => g.logicalId)).toContain("g1");
 		expect(finalEntry?.groups.map((g) => g.logicalId)).toContain("g2");
 	});
@@ -812,7 +822,7 @@ describe("ingestCommand — invalid plan", () => {
 	test("exits non-zero on schema validation failure (plan with 0 units)", async () => {
 		const invalidPlan: NormalizedPlan = {
 			schemaVersion: 1,
-			source: { path: "docs/x.md", contentHash: "sha256:xxx" },
+			source: { path: "docs/x.md", contentHash: H1 },
 			groups: [
 				{
 					kind: "plan",
@@ -838,5 +848,203 @@ describe("ingestCommand — invalid plan", () => {
 		);
 
 		expect(result.exitCode).not.toBe(0);
+	});
+});
+
+// --- FIX 1: plan-parent atomicity — parent created but plan submit fails ---
+
+const PLAN_GROUP_PLAN: NormalizedPlan = {
+	schemaVersion: 1,
+	source: { path: "docs/plan-atomicity.md", contentHash: H8 },
+	groups: [
+		{
+			kind: "plan",
+			logicalId: "g1",
+			title: "Auth System",
+			type: "feature",
+			priority: 1,
+			description:
+				"Full authentication system implementing login endpoint, session middleware, and JWT tokens.",
+			acceptance: ["Login works", "Session persists"],
+			template: "feature",
+			sourceSpan: { start: 0, end: 500 },
+			confidence: "high",
+			units: [
+				{
+					logicalId: "u1",
+					title: "Login endpoint",
+					type: "task",
+					priority: 2,
+					description: "Add login",
+					acceptance: ["Returns JWT"],
+					dependsOn: [],
+					sourceSpan: { start: 0, end: 200 },
+					confidence: "high",
+				},
+				{
+					logicalId: "u2",
+					title: "Session middleware",
+					type: "task",
+					priority: 2,
+					description: "Add middleware",
+					acceptance: ["Session works"],
+					dependsOn: ["u1"],
+					sourceSpan: { start: 200, end: 400 },
+					confidence: "high",
+				},
+			],
+		},
+	],
+	ambiguities: [],
+};
+
+describe("ingestCommand — FIX 1: plan-parent atomicity (parent created, submit fails)", () => {
+	test("parent created but plan submit throws → manifest records parent seedId as pending (partial:true)", async () => {
+		const planPath = await writePlanFile(PLAN_GROUP_PLAN);
+		await ensureOvDir();
+		const manifestPath = join(tempDir, ".overstory", "ingestion-manifest.json");
+
+		const PARENT_ID = "proj-parent-0001";
+		let createCalled = false;
+		const failSubmitClient: SeedsPlanClient = {
+			async executeCreate(_op: CreateOp): Promise<string> {
+				createCalled = true;
+				return PARENT_ID;
+			},
+			async executePlanSubmit(_parentId: string, _op: PlanSubmitOp): Promise<PlanSubmitResult> {
+				throw new Error("sd plan submit: simulated failure");
+			},
+		};
+
+		let threw = false;
+		try {
+			await ingestCommand(
+				{
+					plan: planPath,
+					apply: true,
+					newPlan: false,
+					manifest: manifestPath,
+					cwd: tempDir,
+					json: false,
+				},
+				failSubmitClient,
+			);
+		} catch {
+			threw = true;
+		}
+
+		expect(threw).toBe(true);
+		expect(createCalled).toBe(true);
+
+		// Manifest must record the parent seedId as a pending entry, partial:true
+		const { readFile: rf } = await import("node:fs/promises");
+		const raw = JSON.parse(await rf(manifestPath, "utf8")) as {
+			sources: Record<
+				string,
+				{
+					partial?: boolean;
+					groups: Array<{ logicalId: string; kind: string; seedId: string; planId?: string }>;
+				}
+			>;
+		};
+		const entry = raw.sources["docs/plan-atomicity.md"];
+		expect(entry?.partial).toBe(true);
+
+		// Parent seedId must be recorded even though planId is absent
+		const planEntry = entry?.groups.find((g) => g.logicalId === "g1");
+		expect(planEntry).toBeDefined();
+		expect(planEntry?.kind).toBe("plan");
+		expect(planEntry?.seedId).toBe(PARENT_ID);
+		// planId is absent (pending entry)
+		expect(planEntry?.planId).toBeUndefined();
+	});
+
+	test("re-run after parent-created-but-submit-failed: same parent adopted (no duplicate create), plan submitted", async () => {
+		const planPath = await writePlanFile(PLAN_GROUP_PLAN);
+		await ensureOvDir();
+		const manifestPath = join(tempDir, ".overstory", "ingestion-manifest.json");
+
+		// --- Run 1: parent create succeeds, submit fails ---
+		const PARENT_ID = "proj-parent-run1-0001";
+		const run1Client: SeedsPlanClient = {
+			async executeCreate(_op: CreateOp): Promise<string> {
+				return PARENT_ID;
+			},
+			async executePlanSubmit(_parentId: string, _op: PlanSubmitOp): Promise<PlanSubmitResult> {
+				throw new Error("simulated: plan submit failed");
+			},
+		};
+		try {
+			await ingestCommand(
+				{
+					plan: planPath,
+					apply: true,
+					newPlan: false,
+					manifest: manifestPath,
+					cwd: tempDir,
+					json: false,
+				},
+				run1Client,
+			);
+		} catch {
+			/* expected */
+		}
+
+		// --- Run 2: submit now succeeds ---
+		const run2CreateCalls: Array<{ existingSeedId?: string }> = [];
+		let run2SubmitParentId: string | undefined;
+		const run2Client: SeedsPlanClient = {
+			async executeCreate(op: CreateOp): Promise<string> {
+				run2CreateCalls.push({ existingSeedId: op.existingSeedId });
+				if (op.existingSeedId !== undefined) return op.existingSeedId;
+				return "proj-SHOULD-NOT-BE-CALLED";
+			},
+			async executePlanSubmit(parentId: string, op: PlanSubmitOp): Promise<PlanSubmitResult> {
+				run2SubmitParentId = parentId;
+				const children = op.planJson.sections.steps.map(
+					(_, i) => `proj-child-run2-${String(i + 1).padStart(4, "0")}`,
+				);
+				return { planId: "pl-run2-0001", children, obsolete: [] };
+			},
+		};
+
+		const run2Result = await ingestCommand(
+			{
+				plan: planPath,
+				apply: true,
+				newPlan: false,
+				manifest: manifestPath,
+				cwd: tempDir,
+				json: false,
+			},
+			run2Client,
+		);
+
+		expect(run2Result.exitCode).toBe(0);
+
+		// The parent must be ADOPTED on run 2 — no fresh create call (existingSeedId set)
+		expect(run2CreateCalls).toHaveLength(1);
+		// Key assertion: re-run adopts the existing parent (no duplicate create)
+		expect(run2CreateCalls[0]?.existingSeedId).toBe(PARENT_ID);
+
+		// Plan was submitted with the SAME parent id from run 1
+		expect(run2SubmitParentId).toBe(PARENT_ID);
+
+		// Final manifest: planId present, partial flag cleared
+		const { readFile: rf } = await import("node:fs/promises");
+		const final = JSON.parse(await rf(manifestPath, "utf8")) as {
+			sources: Record<
+				string,
+				{
+					partial?: boolean;
+					groups: Array<{ logicalId: string; seedId: string; planId?: string }>;
+				}
+			>;
+		};
+		const finalEntry = final.sources["docs/plan-atomicity.md"];
+		expect(finalEntry?.partial).toBeUndefined();
+		const finalPlanGroup = finalEntry?.groups.find((g) => g.logicalId === "g1");
+		expect(finalPlanGroup?.seedId).toBe(PARENT_ID); // same parent, no duplicate
+		expect(finalPlanGroup?.planId).toBe("pl-run2-0001");
 	});
 });

@@ -470,9 +470,26 @@ describe("checkClaudeDisableSlashCommands", () => {
 });
 
 describe("checkSdPlanSubmit", () => {
-	test("pass when sd plan --help output mentions 'plan submit'", async () => {
+	// FIX 4: probe is now 'sd plan submit --help'; PASS requires BOTH --plan AND --overwrite.
+
+	test("probes 'sd plan submit --help' (not 'sd plan --help')", async () => {
+		// Verify the spawner receives the correct args
+		let capturedArgs: string[] = [];
+		const spawner = async (args: string[]) => {
+			capturedArgs = args;
+			return {
+				stdout: "Usage: sd plan submit\n  --plan <file>  Plan JSON\n  --overwrite  Overwrite\n",
+				stderr: "",
+			};
+		};
+		await checkSdPlanSubmit(spawner);
+		expect(capturedArgs).toEqual(["sd", "plan", "submit", "--help"]);
+	});
+
+	test("pass when both --plan and --overwrite appear in stdout", async () => {
 		const spawner = async (_args: string[]) => ({
-			stdout: "sd plan submit  Submit a plan for a seed\n  --overwrite  Overwrite existing plan\n",
+			stdout:
+				"Usage: sd plan submit\n  --plan <file|->  Plan JSON file\n  --overwrite  Overwrite existing plan\n",
 			stderr: "",
 		});
 		const check = await checkSdPlanSubmit(spawner);
@@ -484,25 +501,42 @@ describe("checkSdPlanSubmit", () => {
 		expect(check.details?.length).toBeGreaterThan(0);
 	});
 
-	test("pass when 'plan submit' appears in stderr (some sd versions print help to stderr)", async () => {
+	test("pass when both --plan and --overwrite appear in stderr", async () => {
 		const spawner = async (_args: string[]) => ({
 			stdout: "",
-			stderr: "sd plan submit  Submit a plan\n  --overwrite  Overwrite plan\n",
+			stderr: "Usage: sd plan submit\n  --plan <file>  plan json\n  --overwrite  overwrite\n",
 		});
 		const check = await checkSdPlanSubmit(spawner);
 		expect(check.status).toBe("pass");
 	});
 
-	test("pass when only '--overwrite' appears (sufficient signal)", async () => {
+	test("warn when --plan present but --overwrite absent", async () => {
+		// Old build: knows about --plan but not --overwrite (or vice versa)
 		const spawner = async (_args: string[]) => ({
-			stdout: "Commands:\n  submit  submit a plan\n    --overwrite   replace existing\n",
+			stdout: "Usage: sd plan submit\n  --plan <file>  Plan JSON file\n",
 			stderr: "",
 		});
 		const check = await checkSdPlanSubmit(spawner);
-		expect(check.status).toBe("pass");
+		expect(check.name).toBe("sd plan submit support");
+		expect(check.category).toBe("dependencies");
+		expect(check.status).toBe("warn");
+		expect(check.message).toContain("plan submit");
+		expect(check.details).toBeArray();
+		expect(check.details?.length).toBeGreaterThan(0);
+		const detailsText = check.details?.join(" ") ?? "";
+		expect(detailsText).toContain("@os-eco/seeds-cli");
 	});
 
-	test("warn when sd is present but 'plan submit' and '--overwrite' are absent from help", async () => {
+	test("warn when --overwrite present but --plan absent", async () => {
+		const spawner = async (_args: string[]) => ({
+			stdout: "Usage: sd plan submit\n  --overwrite  overwrite\n",
+			stderr: "",
+		});
+		const check = await checkSdPlanSubmit(spawner);
+		expect(check.status).toBe("warn");
+	});
+
+	test("warn when neither --plan nor --overwrite are present", async () => {
 		const spawner = async (_args: string[]) => ({
 			stdout: "Usage: sd [options]\n  create  Create a seed\n",
 			stderr: "",

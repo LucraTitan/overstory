@@ -9,6 +9,9 @@ import { validateNormalizedPlan } from "./validate.ts";
 
 // --- helpers ---
 
+/** Valid 64-char hex hash for test fixtures. */
+const VALID_HASH = `sha256:${"a".repeat(64)}`;
+
 function makeStandalone(overrides: Partial<StandaloneGroup> = {}): StandaloneGroup {
 	return {
 		kind: "standalone",
@@ -67,7 +70,7 @@ function makePlan(overrides: Partial<PlanGroup> = {}): PlanGroup {
 function makePlan2(): NormalizedPlan {
 	return {
 		schemaVersion: 1,
-		source: { path: "docs/prd.md", contentHash: "sha256:abc123" },
+		source: { path: "docs/prd.md", contentHash: VALID_HASH },
 		groups: [makeStandalone(), makePlan()],
 		ambiguities: [],
 	};
@@ -219,7 +222,7 @@ describe("validateNormalizedPlan — reject: dependency cycle", () => {
 	test("u1 → u2 → u1 cycle is rejected", () => {
 		const plan: NormalizedPlan = {
 			schemaVersion: 1,
-			source: { path: "docs/prd.md", contentHash: "sha256:abc" },
+			source: { path: "docs/prd.md", contentHash: VALID_HASH },
 			groups: [
 				{
 					kind: "plan",
@@ -400,6 +403,101 @@ describe("validateNormalizedPlan — A2: plan group feature-only + description >
 					(e) => e.includes("description") && e.includes("50"),
 				);
 		expect(descErr).toBe(false);
+	});
+});
+
+// --- FIX 2: envelope-level checks ---
+
+describe("validateNormalizedPlan — FIX 2: envelope hardening (structured errors, never throw)", () => {
+	test("schemaVersion !== 1 is rejected with structured error", () => {
+		const plan = { ...makePlan2(), schemaVersion: 2 } as unknown as NormalizedPlan;
+		const result = validateNormalizedPlan(plan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.errors.some((e) => e.includes("schemaVersion"))).toBe(true);
+		}
+	});
+
+	test("missing source object is rejected", () => {
+		const plan = { ...makePlan2() } as unknown as NormalizedPlan;
+		(plan as unknown as Record<string, unknown>).source = undefined;
+		const result = validateNormalizedPlan(plan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.errors.some((e) => e.includes("source"))).toBe(true);
+		}
+	});
+
+	test("source.path empty string is rejected", () => {
+		const plan: NormalizedPlan = {
+			...makePlan2(),
+			source: { path: "", contentHash: "sha256:" + "a".repeat(64) },
+		};
+		const result = validateNormalizedPlan(plan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.errors.some((e) => e.includes("source.path"))).toBe(true);
+		}
+	});
+
+	test("source.contentHash with wrong format is rejected", () => {
+		const plan: NormalizedPlan = {
+			...makePlan2(),
+			source: { path: "docs/prd.md", contentHash: "not-a-hash" },
+		};
+		const result = validateNormalizedPlan(plan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.errors.some((e) => e.includes("contentHash"))).toBe(true);
+		}
+	});
+
+	test("source.contentHash sha256 with wrong hex length is rejected", () => {
+		const plan: NormalizedPlan = {
+			...makePlan2(),
+			source: { path: "docs/prd.md", contentHash: "sha256:abc123" }, // too short
+		};
+		const result = validateNormalizedPlan(plan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.errors.some((e) => e.includes("contentHash"))).toBe(true);
+		}
+	});
+
+	test("ambiguities as non-array object is rejected", () => {
+		const plan = { ...makePlan2() } as unknown as NormalizedPlan;
+		(plan as unknown as Record<string, unknown>).ambiguities = { foo: "bar" };
+		const result = validateNormalizedPlan(plan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.errors.some((e) => e.includes("ambiguities"))).toBe(true);
+		}
+	});
+
+	test("groups as empty array is rejected", () => {
+		const plan: NormalizedPlan = { ...makePlan2(), groups: [] };
+		const result = validateNormalizedPlan(plan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.errors.some((e) => e.includes("groups"))).toBe(true);
+		}
+	});
+
+	test("group logicalId colliding with unit logicalId is rejected (global namespace)", () => {
+		// g2 is used as both a group logicalId and a unit logicalId
+		const plan = makePlan2();
+		// Set the plan group's first unit to have the same logicalId as the standalone group
+		(plan.groups[1] as PlanGroup).units[0]!.logicalId = "g1"; // g1 is the standalone group's id
+		const result = validateNormalizedPlan(plan);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.errors.some((e) => e.includes("Duplicate") && e.includes("g1"))).toBe(true);
+		}
+	});
+
+	test("fully valid plan with correct schemaVersion and source passes envelope checks", () => {
+		const result = validateNormalizedPlan(makePlan2());
+		expect(result.ok).toBe(true);
 	});
 });
 

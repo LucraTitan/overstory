@@ -14,31 +14,73 @@ const VALID_CONFIDENCE = new Set(["high", "low"]);
 
 export type ValidationResult = { ok: true; errors: [] } | { ok: false; errors: string[] };
 
+const SHA256_HASH_RE = /^sha256:[0-9a-f]{64}$/;
+
 /**
  * Validate a normalized plan. Returns structured errors; never throws.
  */
 export function validateNormalizedPlan(plan: NormalizedPlan): ValidationResult {
 	const errors: string[] = [];
 
+	// FIX 2: envelope-level checks (structured errors, never throw)
+	const planRecord = plan as unknown as Record<string, unknown>;
+
+	// schemaVersion must be 1
+	if (planRecord.schemaVersion !== 1) {
+		errors.push(`schemaVersion must be 1, got ${JSON.stringify(planRecord.schemaVersion)}`);
+	}
+
+	// source must be present with non-empty path and valid contentHash
+	const source = planRecord.source as Record<string, unknown> | undefined;
+	if (source === undefined || source === null || typeof source !== "object") {
+		errors.push("source must be an object with 'path' and 'contentHash'");
+	} else {
+		if (typeof source.path !== "string" || (source.path as string).trim() === "") {
+			errors.push("source.path must be a non-empty string");
+		}
+		if (
+			typeof source.contentHash !== "string" ||
+			!SHA256_HASH_RE.test(source.contentHash as string)
+		) {
+			errors.push(
+				`source.contentHash must match sha256:<64 hex chars>, got ${JSON.stringify(source.contentHash)}`,
+			);
+		}
+	}
+
+	// ambiguities must be an array if present
+	if (
+		"ambiguities" in planRecord &&
+		planRecord.ambiguities !== undefined &&
+		!Array.isArray(planRecord.ambiguities)
+	) {
+		errors.push("ambiguities must be an array if present");
+	}
+
 	// B4: null/undefined plan.groups guard — never throw
 	if (!Array.isArray(plan.groups)) {
-		errors.push("plan.groups must be an array");
+		errors.push("plan.groups must be a non-empty array");
 		return { ok: false, errors };
 	}
 
-	// B5: cross-group duplicate logicalId check (groups + units all unique)
-	const allGroupIds = new Set<string>();
-	const allUnitIds = new Set<string>();
+	if (plan.groups.length === 0) {
+		errors.push("plan.groups must be a non-empty array");
+		return { ok: false, errors };
+	}
+
+	// FIX 2 + B5: ONE GLOBAL logicalId namespace — no collisions across groups AND units.
+	// A group logicalId matching a unit logicalId is an error (not just within-kind duplicates).
+	const allLogicalIds = new Set<string>(); // unified namespace
 	for (const group of plan.groups) {
 		const gRec = group as unknown as Record<string, unknown>;
 		const gId = gRec.logicalId as string | undefined;
 		if (gId !== undefined) {
-			if (allGroupIds.has(gId)) {
+			if (allLogicalIds.has(gId)) {
 				errors.push(
-					`Duplicate group logicalId '${gId}' — logicalIds must be unique across the whole plan`,
+					`Duplicate logicalId '${gId}' — logicalIds must be unique across groups and units`,
 				);
 			}
-			allGroupIds.add(gId);
+			allLogicalIds.add(gId);
 		}
 		if (
 			(group as { kind?: unknown }).kind === "plan" &&
@@ -47,12 +89,12 @@ export function validateNormalizedPlan(plan: NormalizedPlan): ValidationResult {
 			for (const unit of (group as { units: Array<{ logicalId?: string }> }).units) {
 				const uId = unit.logicalId;
 				if (uId !== undefined) {
-					if (allUnitIds.has(uId)) {
+					if (allLogicalIds.has(uId)) {
 						errors.push(
-							`Duplicate unit logicalId '${uId}' — logicalIds must be unique across the whole plan`,
+							`Duplicate logicalId '${uId}' — logicalIds must be unique across groups and units`,
 						);
 					}
-					allUnitIds.add(uId);
+					allLogicalIds.add(uId);
 				}
 			}
 		}

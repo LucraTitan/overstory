@@ -189,11 +189,11 @@ export async function checkClaudeSettingSources(
  * (reconcile). Older sd builds that lack this subcommand will cause every ingest to fail
  * at apply-time with a cryptic "unknown command" error.
  *
- * Logic:
- * - sd not on PATH → pass/skip (the "sd availability" check handles the missing-binary
- *   case; we must not produce a confusing duplicate here).
- * - sd present, "plan submit" or "--overwrite" in help output → pass.
- * - sd present, neither token present → warn with upgrade hint.
+ * Logic (FIX 4 — precise probe):
+ * - sd not on PATH or spawn fails → pass/skip (the "sd availability" check handles the
+ *   missing-binary case; we must not produce a confusing duplicate here).
+ * - sd present: probe `sd plan submit --help` directly. PASS only if help succeeds AND
+ *   mentions BOTH `--plan` AND `--overwrite`. WARN otherwise (old build or missing flags).
  *
  * No --fix handler: we cannot update the user's seeds-cli installation.
  *
@@ -205,35 +205,36 @@ export async function checkSdPlanSubmit(
 	spawner: HelpSpawner = defaultHelpSpawner,
 ): Promise<DoctorCheck> {
 	try {
-		const { stdout, stderr } = await spawner(["sd", "plan", "--help"]);
+		const { stdout, stderr } = await spawner(["sd", "plan", "submit", "--help"]);
 		const combined = stdout + stderr;
 
-		if (combined.includes("plan submit") || combined.includes("--overwrite")) {
+		// FIX 4: require BOTH --plan and --overwrite to be present (precise pass condition)
+		if (combined.includes("--plan") && combined.includes("--overwrite")) {
 			return {
 				name: "sd plan submit support",
 				category: "dependencies",
 				status: "pass",
 				message: "sd supports plan submit (required by ov ingest)",
-				details: ["sd plan submit / --overwrite flag present in sd plan --help output"],
+				details: ["sd plan submit --help succeeded and mentions both --plan and --overwrite"],
 			};
 		}
 
-		// sd is present but the plan submit surface is absent — old build.
+		// sd plan submit is present but missing required flags — old build.
 		return {
 			name: "sd plan submit support",
 			category: "dependencies",
 			status: "warn",
 			message:
-				"Installed sd lacks 'plan submit'; ov ingest cannot create plans — update @os-eco/seeds-cli",
+				"Installed sd lacks 'plan submit' with required --plan/--overwrite flags; ov ingest cannot create plans — update @os-eco/seeds-cli",
 			details: [
-				"ov ingest drives 'sd plan submit' (fresh create) and 'sd plan submit --overwrite' (reconcile).",
-				"Neither 'plan submit' nor '--overwrite' was found in sd plan --help output.",
+				"ov ingest drives 'sd plan submit --plan - --json' (fresh create) and 'sd plan submit --overwrite' (reconcile).",
+				"Either --plan or --overwrite was absent from 'sd plan submit --help' output.",
 				"Remediation: npm install -g @os-eco/seeds-cli (or bun add -g @os-eco/seeds-cli).",
 			],
 			fixable: true,
 		};
 	} catch {
-		// sd is not on PATH or failed to spawn — skip; the tool-availability
+		// sd is not on PATH or spawn failed — skip; the tool-availability
 		// check (added via tools array) handles the missing-binary case.
 		return {
 			name: "sd plan submit support",
