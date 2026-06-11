@@ -44,6 +44,16 @@ export class ClaudeRuntime implements AgentRuntime {
 	readonly instructionPath = ".claude/CLAUDE.md";
 
 	/**
+	 * Always pass the resolved model to buildDirectSpawn, even for manifest-default pins.
+	 *
+	 * Claude Code has no self-managed model fallback — omitting --model causes it to
+	 * inherit the ambient model of the launching session (e.g. Opus when an operator
+	 * drives via an Opus CC session). This flag makes the call-site gates include the
+	 * model in DirectSpawnOpts regardless of isExplicitOverride.
+	 */
+	readonly alwaysApplyResolvedModel = true;
+
+	/**
 	 * Build the shell command string to spawn an interactive Claude Code agent.
 	 *
 	 * Maps SpawnOpts to the `claude` CLI flags:

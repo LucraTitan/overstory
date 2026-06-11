@@ -7,6 +7,7 @@ import { createEventStore } from "../events/store.ts";
 import { createMailClient } from "../mail/client.ts";
 import { createMailStore } from "../mail/store.ts";
 import { ClaudeRuntime } from "../runtimes/claude.ts";
+import { SaplingRuntime } from "../runtimes/sapling.ts";
 import type { AgentRuntime, DirectSpawnOpts } from "../runtimes/types.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import type { AgentSession, ResolvedModel } from "../types.ts";
@@ -236,6 +237,7 @@ function makeRunOpts(
 		runId?: string | null;
 		capability?: string;
 		_logWarning?: RunnerLogger;
+		resolvedModel?: ResolvedModel;
 	},
 ): Parameters<typeof runTurn>[0] {
 	return {
@@ -252,7 +254,7 @@ function makeRunOpts(
 				message: { role: "user", content: [{ type: "text", text: "hello" }] },
 			})}\n`,
 		runtime: overrides.runtime,
-		resolvedModel: RESOLVED_MODEL,
+		resolvedModel: overrides.resolvedModel ?? RESOLVED_MODEL,
 		runId: overrides.runId ?? null,
 		mailDbPath: ctx.mailDbPath,
 		eventsDbPath: ctx.eventsDbPath,
@@ -2308,5 +2310,166 @@ describe("runTurn scope-violation observability (overstory-9f4d)", () => {
 		});
 
 		expect(detectCalled).toBe(false);
+	});
+});
+
+// ─── Model-pin enforcement: alwaysApplyResolvedModel gate ───────────────────
+//
+// Regression guard for the headless model-pin bug found by the k-overstory
+// ov-verify-runtime harness: when a manifest-default model (isExplicitOverride=false)
+// is resolved, ONLY runtimes with alwaysApplyResolvedModel=true should have the
+// model threaded through to buildDirectSpawn. Runtimes without the flag (e.g.
+// sapling/.sapling) must continue to receive model=undefined so they fall through
+// to their own config.
+
+describe("runTurn model-pin via alwaysApplyResolvedModel", () => {
+	let tempDir: string;
+	let ctx: Ctx;
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "model-pin-test-"));
+		ctx = {
+			overstoryDir: join(tempDir, ".overstory"),
+			worktreePath: join(tempDir, "worktree"),
+			projectRoot: tempDir,
+			mailDbPath: join(tempDir, ".overstory", "mail.db"),
+			eventsDbPath: join(tempDir, ".overstory", "events.db"),
+			sessionsDbPath: join(tempDir, ".overstory", "sessions.db"),
+		};
+		const { mkdir } = await import("node:fs/promises");
+		await mkdir(ctx.overstoryDir, { recursive: true });
+		await mkdir(ctx.worktreePath, { recursive: true });
+	});
+
+	afterEach(async () => {
+		_resetInProcessLocks();
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	test("claude runtime (alwaysApplyResolvedModel=true) passes manifest-default model to buildDirectSpawn", async () => {
+		// isExplicitOverride=false simulates a manifest-default pin (builder→sonnet).
+		// Before the fix, the model gate omitted it because isExplicitOverride was false.
+		const nonExplicitModel: ResolvedModel = {
+			model: "sonnet",
+			env: {},
+			isExplicitOverride: false,
+		};
+
+		const capturedOpts: DirectSpawnOpts[] = [];
+		const base = new ClaudeRuntime();
+		const origBuild = base.buildDirectSpawn.bind(base);
+		(base as unknown as { buildDirectSpawn: (o: DirectSpawnOpts) => string[] }).buildDirectSpawn = (
+			opts: DirectSpawnOpts,
+		) => {
+			capturedOpts.push(opts);
+			return origBuild(opts);
+		};
+
+		seedSession(ctx.sessionsDbPath, { agentName: "pin-claude", state: "working" });
+
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			emitFakeTurn(fake, { sessionId: "pin-claude-sid" });
+			fake._exit(0);
+			return fake;
+		};
+
+		await runTurn({
+			...makeRunOpts(ctx, "pin-claude", {
+				runtime: base,
+				_spawnFn: spawnFn,
+				resolvedModel: nonExplicitModel,
+			}),
+		});
+
+		expect(capturedOpts.length).toBeGreaterThanOrEqual(1);
+		// The model MUST be passed even though isExplicitOverride=false, because
+		// ClaudeRuntime.alwaysApplyResolvedModel is true.
+		expect(capturedOpts[0]?.model).toBe("sonnet");
+	});
+
+	test("sapling runtime (no alwaysApplyResolvedModel) omits model for non-explicit resolved model", async () => {
+		// Sapling manages its own model via .sapling config when not explicitly pinned.
+		// The gate must NOT pass the model through for sapling when isExplicitOverride=false.
+		const nonExplicitModel: ResolvedModel = {
+			model: "sonnet",
+			env: {},
+			isExplicitOverride: false,
+		};
+
+		const capturedOpts: DirectSpawnOpts[] = [];
+		const base = new SaplingRuntime();
+		const origBuild = base.buildDirectSpawn?.bind(base) ?? (() => [] as string[]);
+		(base as unknown as { buildDirectSpawn: (o: DirectSpawnOpts) => string[] }).buildDirectSpawn = (
+			opts: DirectSpawnOpts,
+		) => {
+			capturedOpts.push(opts);
+			return origBuild(opts);
+		};
+
+		seedSession(ctx.sessionsDbPath, { agentName: "pin-sapling", state: "working" });
+
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			emitFakeTurn(fake, { sessionId: "pin-sapling-sid" });
+			fake._exit(0);
+			return fake;
+		};
+
+		await runTurn({
+			...makeRunOpts(ctx, "pin-sapling", {
+				runtime: base,
+				_spawnFn: spawnFn,
+				resolvedModel: nonExplicitModel,
+			}),
+		});
+
+		expect(capturedOpts.length).toBeGreaterThanOrEqual(1);
+		// model must be undefined — sapling defers to its own .sapling config.
+		expect(capturedOpts[0]?.model).toBeUndefined();
+	});
+
+	test("both runtimes pass model when isExplicitOverride=true (existing behavior preserved)", async () => {
+		// When isExplicitOverride=true the gate was always true — verify no regression.
+		const explicitModel: ResolvedModel = {
+			model: "claude-opus-4-8",
+			env: {},
+			isExplicitOverride: true,
+		};
+
+		for (const [label, runtime] of [
+			["claude", new ClaudeRuntime()],
+			["sapling", new SaplingRuntime()],
+		] as [string, AgentRuntime][]) {
+			const capturedOpts: DirectSpawnOpts[] = [];
+			const origBuild = runtime.buildDirectSpawn?.bind(runtime) ?? (() => [] as string[]);
+			(
+				runtime as unknown as { buildDirectSpawn: (o: DirectSpawnOpts) => string[] }
+			).buildDirectSpawn = (opts: DirectSpawnOpts) => {
+				capturedOpts.push(opts);
+				return origBuild(opts);
+			};
+
+			const agentName = `pin-explicit-${label}`;
+			seedSession(ctx.sessionsDbPath, { agentName, state: "working" });
+
+			const fake = makeFakeProc();
+			const spawnFn: TurnSpawnFn = () => {
+				emitFakeTurn(fake, { sessionId: `${agentName}-sid` });
+				fake._exit(0);
+				return fake;
+			};
+
+			await runTurn({
+				...makeRunOpts(ctx, agentName, {
+					runtime,
+					_spawnFn: spawnFn,
+					resolvedModel: explicitModel,
+				}),
+			});
+
+			expect(capturedOpts.length).toBeGreaterThanOrEqual(1);
+			expect(capturedOpts[0]?.model).toBe("claude-opus-4-8");
+		}
 	});
 });

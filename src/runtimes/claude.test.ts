@@ -901,6 +901,15 @@ describe("ClaudeRuntime.buildDirectSpawn", () => {
 	});
 });
 
+// ─── alwaysApplyResolvedModel capability flag ────────────────────────────────
+
+describe("ClaudeRuntime.alwaysApplyResolvedModel", () => {
+	test("ClaudeRuntime exposes alwaysApplyResolvedModel === true", () => {
+		const runtime = new ClaudeRuntime();
+		expect(runtime.alwaysApplyResolvedModel).toBe(true);
+	});
+});
+
 // ─── parseEvents unit tests ──────────────────────────────────────────────────
 
 function toStream(s: string): ReadableStream<Uint8Array> {

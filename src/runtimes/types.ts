@@ -244,6 +244,23 @@ export interface AgentRuntime {
 	readonly headless?: boolean;
 
 	/**
+	 * When true, the resolved model (including manifest-default pins) is always passed
+	 * to buildDirectSpawn even when isExplicitOverride is false.
+	 *
+	 * Set this true for runtimes that have no meaningful self-managed model default and
+	 * would otherwise fall back to the ambient launching session's model (e.g. claude,
+	 * whose only fallback is the parent claude -p session's model — causing builders to
+	 * silently run on Opus instead of their pinned Sonnet when the operator launches
+	 * via an Opus session).
+	 *
+	 * Leave false (or omit) for runtimes that manage their own model config when
+	 * unpinned (e.g. sapling reads its .sapling config) — those must receive
+	 * model=undefined so they apply their own default rather than the overstory manifest
+	 * default.
+	 */
+	readonly alwaysApplyResolvedModel?: boolean;
+
+	/**
 	 * Build the argv array for Bun.spawn() to launch a headless agent subprocess.
 	 * Only headless runtimes implement this method.
 	 * The returned array is passed directly to Bun.spawn() — no shell interpolation.

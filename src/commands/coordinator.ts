@@ -528,7 +528,9 @@ export async function startCoordinatorSession(
 			const argv = runtime.buildDirectSpawn({
 				cwd: projectRoot,
 				env: directEnv,
-				...(resolvedModel.isExplicitOverride ? { model: resolvedModel.model } : {}),
+				...(resolvedModel.isExplicitOverride || runtime.alwaysApplyResolvedModel
+					? { model: resolvedModel.model }
+					: {}),
 				instructionPath: runtime.instructionPath,
 			});
 

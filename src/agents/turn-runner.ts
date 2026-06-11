@@ -768,7 +768,9 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 		const directOpts: DirectSpawnOpts = {
 			cwd: worktreePath,
 			env: directEnv,
-			...(resolvedModel.isExplicitOverride ? { model: resolvedModel.model } : {}),
+			...(resolvedModel.isExplicitOverride || runtime.alwaysApplyResolvedModel
+				? { model: resolvedModel.model }
+				: {}),
 			instructionPath: runtime.instructionPath,
 			resumeSessionId: priorSessionId,
 		};
