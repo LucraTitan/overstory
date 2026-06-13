@@ -98,19 +98,32 @@ const COORDINATION_CAPABILITIES = new Set(["coordinator", "orchestrator", "super
  *
  * This derives `isError` from `outcome` for result events: a clean completion
  * requires `outcome === "success"`; `"error"` and `"max_turns"` are failures.
- * Backward-compat rules (immutability preserved — returns a new object, never
- * mutates the input):
- * - An explicit `isError` already on the event WINS (claude-shaped results and
- *   any future sapling shape that sets it pass through untouched).
- * - A result event with neither `outcome` nor `isError` is returned unchanged.
+ * Rules (immutability preserved — returns a new object, never mutates the input):
+ * - An explicit `isError` already on the event WINS (any future sapling shape
+ *   that sets it pass through untouched — `isError:false` stays clean,
+ *   `isError:true` stays a failure).
+ * - `outcome === "success"` → clean (`isError:false`).
+ * - Any OTHER recognized outcome string (`"error"`, `"max_turns"`) → failure.
+ * - A `result` event with NEITHER a recognizable success discriminator
+ *   (`outcome === "success"` or explicit `isError === false`) FAILS CLOSED:
+ *   `isError:true`. This runs only inside `SaplingRuntime.parseEvents`, so every
+ *   `result` here is a sapling terminal result — a malformed one lacking any
+ *   success signal (no string `outcome`, no explicit `isError`) must NOT be
+ *   treated as a clean completion (that would false-complete a failure as
+ *   success). Failing closed makes the worst case a spurious failure signal, not
+ *   a silently-dropped failure.
  * - Non-`result` events are never touched, even if they carry an `outcome`.
  */
 function normalizeResultEvent(event: AgentEvent): AgentEvent {
 	if (event.type !== "result") return event;
-	// An explicit discriminator already present — respect it.
+	// An explicit discriminator already present — respect it (true or false).
 	if ("isError" in event) return event;
-	if (typeof event.outcome !== "string") return event;
-	return { ...event, isError: event.outcome !== "success" };
+	// A recognizable clean success discriminator keeps the result clean.
+	if (event.outcome === "success") return { ...event, isError: false };
+	// Otherwise FAIL CLOSED: a sapling result with no success signal (a known
+	// failure outcome, an unrecognized/non-string outcome, or no outcome at all)
+	// is treated as a failure so a malformed result never false-completes.
+	return { ...event, isError: true };
 }
 
 /**

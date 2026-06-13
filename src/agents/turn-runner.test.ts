@@ -1287,6 +1287,78 @@ describe("runTurn", () => {
 			const merged = sharedMail.getAll({ to: "lead-merge", type: "merged" });
 			expect(merged.length).toBe(1);
 			expect(merged[0]?.from).toBe("sap-merge");
+			// HIGH B: the payload must be a capability-correct MergedPayload
+			// ({ branch, taskId, tier }) — NOT a WorkerDonePayload. A consumer that
+			// parses `merged` mail expects `tier`, not `exitCode`/`filesModified`.
+			const payload = JSON.parse(merged[0]?.payload ?? "{}") as Record<string, unknown>;
+			expect(payload.branch).toBe("agent/sap-merge");
+			// taskId is the runner's authoritative run-opts task id (makeRunOpts).
+			expect(payload.taskId).toBe("task-test");
+			expect(payload.tier).toBe("clean-merge");
+			expect(payload.exitCode).toBeUndefined();
+			expect(payload.filesModified).toBeUndefined();
+		} finally {
+			sharedMail.close();
+		}
+	});
+
+	test("event-signaling runtime: success synthesis is SKIPPED when terminal mail was already observed (no double-signal)", async () => {
+		// Non-blocking 1: if the worker DID send its own terminal mail AND
+		// completedViaEvents, ov must not also synthesize one — exactly one signal.
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "sap-dbl",
+			state: "working",
+			parentAgent: "lead-dbl",
+			capability: "builder",
+			taskId: "task-dbl",
+			branchName: "agent/sap-dbl",
+		});
+		const { runtime } = makeEventSignalingRuntime();
+		const fake = makeFakeProc();
+		// Seed the worker's OWN terminal mail DURING the turn (after snapshotTs)
+		// so terminalMailObserved becomes true for this turn — mirrors a worker
+		// that both event-signaled AND sent its own worker_done.
+		const spawnFn: TurnSpawnFn = () => {
+			(async () => {
+				await Bun.sleep(20);
+				const s = createMailStore(ctx.mailDbPath);
+				try {
+					createMailClient(s).sendProtocol({
+						from: "sap-dbl",
+						to: "lead-dbl",
+						subject: "Worker done: task-dbl",
+						body: "self-reported",
+						type: "worker_done",
+						priority: "normal",
+						payload: {
+							taskId: "task-dbl",
+							branch: "agent/sap-dbl",
+							exitCode: 0,
+							filesModified: [],
+						},
+					});
+				} finally {
+					s.close();
+				}
+				emitFakeTurn(fake, { sessionId: "sap-dbl-sess", isError: false });
+				fake._exit(0);
+			})();
+			return fake;
+		};
+
+		const sharedMail = createMailStore(ctx.mailDbPath);
+		try {
+			const result = await runTurn({
+				...makeRunOpts(ctx, "sap-dbl", { runtime, _spawnFn: spawnFn }),
+				_mailStore: sharedMail,
+			});
+			expect(result.finalState).toBe("completed");
+			// Exactly ONE worker_done total (the worker's own) — no synthesized second.
+			const done = sharedMail.getAll({ to: "lead-dbl", type: "worker_done" });
+			expect(done.length).toBe(1);
+			expect(done[0]?.body).toBe("self-reported");
+			const died = sharedMail.getAll({ to: "lead-dbl", type: "worker_died" });
+			expect(died.length).toBe(0);
 		} finally {
 			sharedMail.close();
 		}
@@ -1327,15 +1399,19 @@ describe("runTurn", () => {
 		}
 	});
 
-	test("event-signaling runtime: errored result with a parent does NOT synthesize a worker_done", async () => {
-		// completedViaEvents must be false when the result is not clean; an errored
-		// sapling child must not have a fake success mail synthesized for it.
+	test("event-signaling runtime: errored result with a parent wakes the parent via exactly one worker_died (HIGH A)", async () => {
+		// A terminal FAILURE result (outcome error/max_turns → isError true) is NOT
+		// completedViaEvents, so no success mail. But the parent still must be woken
+		// — a spawn-per-turn lead waiting on a failed sapling builder would otherwise
+		// hang forever. ov synthesizes exactly one `worker_died` (failure signal),
+		// never a `worker_done`, and never a double-signal.
 		seedSession(ctx.sessionsDbPath, {
 			agentName: "sap-wake-err",
 			state: "working",
 			parentAgent: "lead-wake-err",
 			capability: "builder",
 			taskId: "task-wake-err",
+			branchName: "agent/sap-wake-err",
 		});
 		const { runtime } = makeEventSignalingRuntime();
 		const fake = makeFakeProc();
@@ -1352,7 +1428,227 @@ describe("runTurn", () => {
 				_mailStore: sharedMail,
 			});
 			expect(result.finalState).not.toBe("completed");
+			// No fake success mail for a failed child.
 			const done = sharedMail.getAll({ to: "lead-wake-err", type: "worker_done" });
+			expect(done.length).toBe(0);
+			// Exactly one failure signal so the lead wakes and can react.
+			const died = sharedMail.getAll({ to: "lead-wake-err", type: "worker_died" });
+			expect(died.length).toBe(1);
+			expect(died[0]?.from).toBe("sap-wake-err");
+			const payload = JSON.parse(died[0]?.payload ?? "{}") as Record<string, unknown>;
+			expect(payload.agentName).toBe("sap-wake-err");
+			expect(payload.capability).toBe("builder");
+			// taskId is the runner's authoritative run-opts task id (makeRunOpts).
+			expect(payload.taskId).toBe("task-test");
+			expect(payload.terminatedBy).toBe("runner");
+		} finally {
+			sharedMail.close();
+		}
+	});
+
+	test("event-signaling runtime: errored MERGER result wakes the parent via one worker_died (failure, not 'merged')", async () => {
+		// A failed merger child must wake its lead via the death path, not a
+		// (success) `merged` mail.
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "sap-merge-err",
+			state: "working",
+			parentAgent: "lead-merge-err",
+			capability: "merger",
+			taskId: "task-merge-err",
+			branchName: "agent/sap-merge-err",
+		});
+		const { runtime } = makeEventSignalingRuntime();
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			emitFakeTurn(fake, { sessionId: "sap-merge-err-sess", isError: true });
+			fake._exit(1);
+			return fake;
+		};
+
+		const sharedMail = createMailStore(ctx.mailDbPath);
+		try {
+			const result = await runTurn({
+				...makeRunOpts(ctx, "sap-merge-err", {
+					runtime,
+					_spawnFn: spawnFn,
+					capability: "merger",
+				}),
+				_mailStore: sharedMail,
+			});
+			expect(result.finalState).not.toBe("completed");
+			const merged = sharedMail.getAll({ to: "lead-merge-err", type: "merged" });
+			expect(merged.length).toBe(0);
+			const died = sharedMail.getAll({ to: "lead-merge-err", type: "worker_died" });
+			expect(died.length).toBe(1);
+		} finally {
+			sharedMail.close();
+		}
+	});
+
+	test("event-signaling runtime: own terminal mail + non-clean exit → NO synthesized worker_died (no double-signal)", async () => {
+		// Codex re-gate edge: if an event-signaling worker DID send its own terminal
+		// mail this turn but then exits without a clean `result`, the parent is
+		// already woken by that mail — synthesizing a worker_died on top would be a
+		// contradictory double-signal. The failure branch is gated on
+		// !terminalMailObserved, so exactly one signal (the worker's own) results.
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "sap-own",
+			state: "working",
+			parentAgent: "lead-own",
+			capability: "builder",
+			taskId: "task-own",
+			branchName: "agent/sap-own",
+		});
+		const { runtime } = makeEventSignalingRuntime();
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			(async () => {
+				await Bun.sleep(20);
+				const s = createMailStore(ctx.mailDbPath);
+				try {
+					createMailClient(s).sendProtocol({
+						from: "sap-own",
+						to: "lead-own",
+						subject: "Worker done: task-own",
+						body: "self-reported",
+						type: "worker_done",
+						priority: "normal",
+						payload: {
+							taskId: "task-own",
+							branch: "agent/sap-own",
+							exitCode: 1,
+							filesModified: [],
+						},
+					});
+				} finally {
+					s.close();
+				}
+				// Exit non-clean WITHOUT a result event (cleanResult stays false).
+				fake._pushLine(
+					JSON.stringify({ type: "system", subtype: "init", session_id: "sap-own-sess" }),
+				);
+				fake._exit(1);
+			})();
+			return fake;
+		};
+
+		const sharedMail = createMailStore(ctx.mailDbPath);
+		try {
+			const result = await runTurn({
+				...makeRunOpts(ctx, "sap-own", { runtime, _spawnFn: spawnFn }),
+				_mailStore: sharedMail,
+			});
+			expect(result.terminalMailObserved).toBe(true);
+			// Exactly ONE worker_done (the worker's own); NO synthesized worker_died.
+			const done = sharedMail.getAll({ to: "lead-own", type: "worker_done" });
+			expect(done.length).toBe(1);
+			expect(done[0]?.body).toBe("self-reported");
+			const died = sharedMail.getAll({ to: "lead-own", type: "worker_died" });
+			expect(died.length).toBe(0);
+		} finally {
+			sharedMail.close();
+		}
+	});
+
+	test("event-signaling runtime: process exits non-clean with NO result event still wakes parent (no zero-signal)", async () => {
+		// Codex re-gate finding: an event-signaling worker whose process dies/exits
+		// without EVER emitting a `result` (sawResultEvent would be false) is a
+		// terminal failure with no "next batch" coming. It is neither
+		// completedViaEvents, nor aborted/stalled (zombie), nor terminalMailMissing
+		// (that requires cleanResult) — so without a fix it gets ZERO parent signal
+		// and the lead hangs. Must synthesize exactly one worker_died.
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "sap-crash",
+			state: "working",
+			parentAgent: "lead-crash",
+			capability: "builder",
+			taskId: "task-crash",
+			branchName: "agent/sap-crash",
+		});
+		const { runtime } = makeEventSignalingRuntime();
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			// Emit a non-result event so the turn observed activity (→ between_turns
+			// territory), then the process exits non-zero WITHOUT a result event.
+			fake._pushLine(
+				JSON.stringify({ type: "system", subtype: "init", session_id: "sap-crash-sess" }),
+			);
+			fake._exit(1);
+			return fake;
+		};
+
+		const sharedMail = createMailStore(ctx.mailDbPath);
+		try {
+			const result = await runTurn({
+				...makeRunOpts(ctx, "sap-crash", { runtime, _spawnFn: spawnFn }),
+				_mailStore: sharedMail,
+			});
+			expect(result.cleanResult).toBe(false);
+			expect(result.finalState).not.toBe("completed");
+			const died = sharedMail.getAll({ to: "lead-crash", type: "worker_died" });
+			expect(died.length).toBe(1);
+			expect(died[0]?.from).toBe("sap-crash");
+			const done = sharedMail.getAll({ to: "lead-crash", type: "worker_done" });
+			expect(done.length).toBe(0);
+		} finally {
+			sharedMail.close();
+		}
+	});
+
+	test("event-signaling runtime: ABORT after a failing result still wakes the parent exactly once (no zero-signal)", async () => {
+		// Edge: an event-signaling turn that saw a failing `result` AND then aborted
+		// (zombie). Neither success (not clean) nor the event-failure path (gated on
+		// !aborted) fires — so the death path MUST cover it. Exactly one worker_died.
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "sap-abort",
+			state: "working",
+			parentAgent: "lead-abort",
+			capability: "builder",
+			taskId: "task-abort",
+			branchName: "agent/sap-abort",
+			claudeSessionId: "prior-abort",
+		});
+		const { runtime } = makeEventSignalingRuntime();
+		const fake = makeFakeProc();
+		const ac = new AbortController();
+		const spawnFn: TurnSpawnFn = () => {
+			// Emit a FAILING result, then hang so the operator abort lands.
+			fake._pushLine(
+				JSON.stringify({
+					type: "result",
+					subtype: "error",
+					session_id: "prior-abort",
+					is_error: true,
+					duration_ms: 10,
+					num_turns: 1,
+				}),
+			);
+			return fake;
+		};
+
+		const sharedMail = createMailStore(ctx.mailDbPath);
+		try {
+			const runPromise = runTurn({
+				...makeRunOpts(ctx, "sap-abort", {
+					runtime,
+					_spawnFn: spawnFn,
+					abortSignal: ac.signal,
+					sigkillDelayMs: 25,
+				}),
+				_mailStore: sharedMail,
+			});
+			await Bun.sleep(60);
+			ac.abort();
+			const result = await runPromise;
+
+			expect(result.finalState).toBe("zombie");
+			// Exactly one wake — never zero (the bug), never two.
+			const died = sharedMail.getAll({ to: "lead-abort", type: "worker_died" });
+			expect(died.length).toBe(1);
+			expect(died[0]?.from).toBe("sap-abort");
+			const reason = JSON.parse(died[0]?.payload ?? "{}").reason as string;
+			expect(reason).toContain("Aborted");
+			const done = sharedMail.getAll({ to: "lead-abort", type: "worker_done" });
 			expect(done.length).toBe(0);
 		} finally {
 			sharedMail.close();
