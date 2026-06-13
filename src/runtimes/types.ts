@@ -127,6 +127,24 @@ export interface DirectSpawnOpts {
 	/** Path to the instruction/overlay file for this agent. */
 	instructionPath: string;
 	/**
+	 * Agent name (overstory identity). When present, runtimes that support an
+	 * ecosystem identity flag emit it (sapling: `--agent-name <name>`). The same
+	 * value is also exported as OVERSTORY_AGENT_NAME in env; carried here as a typed
+	 * field so adapters don't have to reach into the namespaced env to build argv.
+	 */
+	agentName?: string;
+	/**
+	 * Task id for this dispatch. When present, runtimes that support a task-id flag
+	 * emit it (sapling: `--task-id <id>`). Mirrors OVERSTORY_TASK_ID in env.
+	 */
+	taskId?: string;
+	/**
+	 * Absolute path to the agent's worktree. Runtimes that derive per-worktree
+	 * file paths (e.g. sapling's `--guards-file`/`--metrics-path`) use this when
+	 * present; falls back to `cwd` when absent. Mirrors OVERSTORY_WORKTREE_PATH in env.
+	 */
+	worktreePath?: string;
+	/**
 	 * Runtime-provided session id to resume on follow-up spawns.
 	 *
 	 * Present only on follow-up spawns — when a non-empty string, the runtime
@@ -259,6 +277,20 @@ export interface AgentRuntime {
 	 * default.
 	 */
 	readonly alwaysApplyResolvedModel?: boolean;
+
+	/**
+	 * When true, this runtime signals task completion via its NDJSON event stream
+	 * (a terminal `result` event) rather than by sending an `ov mail` of a
+	 * capability-specific terminal type (worker_done | result | merged | …).
+	 *
+	 * The turn-runner treats a clean `result` event from such a runtime as the
+	 * terminal signal: it does NOT log a "exited cleanly without sending terminal
+	 * mail" contract violation, and it does NOT synthesize a `worker_died` mail to
+	 * the parent on that clean exit. Set true for headless runtimes that, post
+	 * Warren-decoupling, no longer make outbound `ov mail` calls (sapling). Leave
+	 * unset for runtimes whose workers still send terminal mail (claude).
+	 */
+	readonly signalsCompletionViaEvents?: boolean;
 
 	/**
 	 * Build the argv array for Bun.spawn() to launch a headless agent subprocess.

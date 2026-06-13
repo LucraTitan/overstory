@@ -359,6 +359,15 @@ export class SaplingRuntime implements AgentRuntime {
 	readonly headless = true;
 
 	/**
+	 * Sapling signals task completion via its NDJSON `result` event, NOT via an
+	 * outbound `ov mail`. Post Warren-decoupling, sapling workers no longer make
+	 * `ov mail` calls, so the turn-runner must treat a clean `result` event as the
+	 * terminal signal — otherwise a clean sapling exit is flagged as a "no terminal
+	 * mail" contract violation and the parent is told the worker died.
+	 */
+	readonly signalsCompletionViaEvents = true;
+
+	/**
 	 * Build the shell command string to spawn a Sapling agent in a tmux pane.
 	 *
 	 * This method exists for the TUI fallback path (e.g., `ov sling --runtime sapling`
@@ -452,14 +461,35 @@ export class SaplingRuntime implements AgentRuntime {
 			}
 			argv.push("--model", model);
 		}
-		argv.push(
-			"--json",
-			"--cwd",
-			opts.cwd,
-			"--system-prompt-file",
-			opts.instructionPath,
-			"Read SAPLING.md for your task assignment and begin immediately.",
-		);
+		argv.push("--json", "--cwd", opts.cwd, "--system-prompt-file", opts.instructionPath);
+
+		// Per-worktree base path for guards/metrics. deployConfig writes
+		// .sapling/guards.json into the worktree; the same path must be passed to
+		// `sp run --guards-file` because sp 0.3.2 loads guards ONLY via the explicit
+		// flag (it does not auto-discover .sapling/guards.json). Prefer the explicit
+		// worktreePath when present, else fall back to cwd (they are the same in the
+		// normal headless-worker spawn path).
+		const worktreeBase = opts.worktreePath ?? opts.cwd;
+
+		// Patch (b): point sp at the guards file deployConfig already wrote.
+		argv.push("--guards-file", join(worktreeBase, ".sapling", "guards.json"));
+
+		// Patch (c): ecosystem identity + metrics flags. agentName/taskId come from
+		// the dispatch (also exported as OVERSTORY_AGENT_NAME/OVERSTORY_TASK_ID env).
+		// Omit a single flag gracefully rather than passing an empty operand when a
+		// value is absent.
+		if (opts.agentName) {
+			argv.push("--agent-name", opts.agentName);
+		}
+		if (opts.taskId) {
+			argv.push("--task-id", opts.taskId);
+		}
+		// Metrics land under the worktree so they're scoped per-agent and cleaned
+		// up with the worktree.
+		argv.push("--metrics-path", join(worktreeBase, ".sapling", "metrics.json"));
+
+		// Prompt remains the final positional argument: `sp run [flags] <prompt>`.
+		argv.push("Read SAPLING.md for your task assignment and begin immediately.");
 		return argv;
 	}
 

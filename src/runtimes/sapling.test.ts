@@ -61,6 +61,10 @@ describe("SaplingRuntime", () => {
 		test("headless is true", () => {
 			expect(runtime.headless).toBe(true);
 		});
+
+		test("signalsCompletionViaEvents is true (sapling sends no terminal mail post-decoupling)", () => {
+			expect(runtime.signalsCompletionViaEvents).toBe(true);
+		});
 	});
 
 	describe("buildSpawnCommand", () => {
@@ -256,8 +260,93 @@ describe("SaplingRuntime", () => {
 				"/project/.overstory/worktrees/builder-1",
 				"--system-prompt-file",
 				"/project/.overstory/worktrees/builder-1/SAPLING.md",
+				"--guards-file",
+				"/project/.overstory/worktrees/builder-1/.sapling/guards.json",
+				"--metrics-path",
+				"/project/.overstory/worktrees/builder-1/.sapling/metrics.json",
 				"Read SAPLING.md for your task assignment and begin immediately.",
 			]);
+		});
+
+		test("appends --guards-file pointing at <cwd>/.sapling/guards.json (matches deployConfig)", () => {
+			const opts: DirectSpawnOpts = {
+				cwd: "/project/.overstory/worktrees/builder-1",
+				env: {},
+				instructionPath: "/project/.overstory/worktrees/builder-1/SAPLING.md",
+			};
+			const argv = runtime.buildDirectSpawn(opts);
+			const idx = argv.indexOf("--guards-file");
+			expect(idx).toBeGreaterThan(-1);
+			expect(argv[idx + 1]).toBe("/project/.overstory/worktrees/builder-1/.sapling/guards.json");
+		});
+
+		test("--guards-file is derived from worktreePath when provided (not cwd)", () => {
+			const opts: DirectSpawnOpts = {
+				cwd: "/some/other/cwd",
+				worktreePath: "/project/.overstory/worktrees/builder-1",
+				env: {},
+				instructionPath: "/project/.overstory/worktrees/builder-1/SAPLING.md",
+			};
+			const argv = runtime.buildDirectSpawn(opts);
+			const idx = argv.indexOf("--guards-file");
+			expect(argv[idx + 1]).toBe("/project/.overstory/worktrees/builder-1/.sapling/guards.json");
+		});
+
+		test("appends --metrics-path under <worktree>/.sapling/metrics.json", () => {
+			const opts: DirectSpawnOpts = {
+				cwd: "/project/.overstory/worktrees/builder-1",
+				env: {},
+				instructionPath: "/project/.overstory/worktrees/builder-1/SAPLING.md",
+			};
+			const argv = runtime.buildDirectSpawn(opts);
+			const idx = argv.indexOf("--metrics-path");
+			expect(idx).toBeGreaterThan(-1);
+			expect(argv[idx + 1]).toBe("/project/.overstory/worktrees/builder-1/.sapling/metrics.json");
+		});
+
+		test("appends --agent-name and --task-id when provided", () => {
+			const opts: DirectSpawnOpts = {
+				cwd: "/project/worktree",
+				env: {},
+				instructionPath: "/project/worktree/SAPLING.md",
+				agentName: "builder-1",
+				taskId: "task-abc",
+			};
+			const argv = runtime.buildDirectSpawn(opts);
+			const nameIdx = argv.indexOf("--agent-name");
+			const taskIdx = argv.indexOf("--task-id");
+			expect(nameIdx).toBeGreaterThan(-1);
+			expect(argv[nameIdx + 1]).toBe("builder-1");
+			expect(taskIdx).toBeGreaterThan(-1);
+			expect(argv[taskIdx + 1]).toBe("task-abc");
+		});
+
+		test("omits --agent-name / --task-id gracefully when not provided", () => {
+			const opts: DirectSpawnOpts = {
+				cwd: "/project/worktree",
+				env: {},
+				instructionPath: "/project/worktree/SAPLING.md",
+			};
+			const argv = runtime.buildDirectSpawn(opts);
+			expect(argv).not.toContain("--agent-name");
+			expect(argv).not.toContain("--task-id");
+			// no empty-string operand ever appended
+			expect(argv).not.toContain("");
+		});
+
+		test("the prompt remains the final positional argument after all flags", () => {
+			const opts: DirectSpawnOpts = {
+				model: "sonnet",
+				cwd: "/project/worktree",
+				env: {},
+				instructionPath: "/project/worktree/SAPLING.md",
+				agentName: "builder-1",
+				taskId: "task-abc",
+			};
+			const argv = runtime.buildDirectSpawn(opts);
+			expect(argv[argv.length - 1]).toBe(
+				"Read SAPLING.md for your task assignment and begin immediately.",
+			);
 		});
 
 		test("resolves model alias from ANTHROPIC_DEFAULT_<MODEL>_MODEL env var", () => {
