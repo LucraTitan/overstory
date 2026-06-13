@@ -772,6 +772,12 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 				? { model: resolvedModel.model }
 				: {}),
 			instructionPath: runtime.instructionPath,
+			// Carry overstory identity as typed fields so runtimes can emit ecosystem
+			// flags (sapling: --agent-name / --task-id / --guards-file / --metrics-path)
+			// without reaching into the namespaced OVERSTORY_* env.
+			agentName,
+			taskId,
+			worktreePath,
 			resumeSessionId: priorSessionId,
 		};
 		const argv = runtime.buildDirectSpawn(directOpts);
@@ -1248,13 +1254,23 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 		const resumeMismatch =
 			priorSessionId !== null && newSessionId !== null && newSessionId !== priorSessionId;
 
+		// Event-signaling runtimes (sapling, post Warren-decoupling) report
+		// completion via a clean `result` NDJSON event and make NO outbound
+		// `ov mail` calls. For these, a clean result IS the terminal signal — it
+		// must NOT be treated as a missing-terminal-mail contract violation, and
+		// must NOT trigger a synthesized `worker_died` to the parent. Runtimes
+		// whose workers still send terminal mail (claude) leave the flag unset and
+		// keep the original mail-based contract.
+		const completedViaEvents = runtime.signalsCompletionViaEvents === true && cleanResult;
+
 		// Contract violation (overstory-6071): claude exited cleanly (saw a
 		// `result` event with isError:false) but never sent the capability's
 		// terminal mail. Pre-fix this fell through to `working` and stayed
 		// there forever — the process is gone but the session looks alive.
 		// Surface loudly via the runner diagnostic sink and settle to
 		// `completed` so operators don't see a zombie-but-labeled-working row.
-		const terminalMailMissing = cleanResult && !terminalMailObserved && !aborted && !stallAborted;
+		const terminalMailMissing =
+			cleanResult && !terminalMailObserved && !completedViaEvents && !aborted && !stallAborted;
 		if (terminalMailMissing) {
 			const expected = terminalMailTypesFor(capability).join("|") || "<none>";
 			runnerLog(
@@ -1266,6 +1282,9 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 		let finalState: AgentState;
 		if (aborted || stallAborted) {
 			finalState = "zombie";
+		} else if (completedViaEvents) {
+			// Clean `result` from an event-signaling runtime — terminal, no mail.
+			finalState = "completed";
 		} else if (cleanResult && terminalMailObserved) {
 			finalState = "completed";
 		} else if (terminalMailMissing) {

@@ -158,6 +158,22 @@ function makeSpyRuntime(): {
 	return { runtime: base, spawnCalls: calls };
 }
 
+/**
+ * Spy runtime that signals completion via the event stream (like sapling
+ * post Warren-decoupling). Reuses ClaudeRuntime's parser so the FakeProc's
+ * Claude-shaped `result` event still drives `cleanResult`, but sets
+ * `signalsCompletionViaEvents = true` so a clean result is terminal WITHOUT
+ * requiring terminal mail.
+ */
+function makeEventSignalingRuntime(): {
+	runtime: AgentRuntime;
+	spawnCalls: Array<DirectSpawnOpts & { resumeSessionId?: string | null }>;
+} {
+	const { runtime, spawnCalls } = makeSpyRuntime();
+	(runtime as { signalsCompletionViaEvents?: boolean }).signalsCompletionViaEvents = true;
+	return { runtime, spawnCalls };
+}
+
 // ---------- session bootstrap ----------
 
 function seedSession(
@@ -1108,6 +1124,112 @@ describe("runTurn", () => {
 		} finally {
 			sharedMail.close();
 		}
+	});
+
+	// --- Event-signaling runtime completion (sapling, post Warren-decoupling) ---
+	//
+	// Sapling reports completion via a clean `result` NDJSON event and makes NO
+	// outbound `ov mail` calls. A runtime with signalsCompletionViaEvents=true
+	// must therefore: (1) settle to `completed` on a clean result, (2) NOT log a
+	// missing-terminal-mail contract violation, (3) NOT synthesize a worker_died
+	// mail to the parent.
+
+	test("event-signaling runtime: clean result settles to completed without a contract violation", async () => {
+		seedSession(ctx.sessionsDbPath, { agentName: "sap-clean", state: "booting" });
+		const { runtime } = makeEventSignalingRuntime();
+
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			emitFakeTurn(fake, { sessionId: "sap-sess", isError: false });
+			fake._exit(0);
+			return fake;
+		};
+
+		// Fail the test if a contract-violation error is logged.
+		const logged: Array<{ level: string; msg: string }> = [];
+		const logger: RunnerLogger = (level, msg) => {
+			logged.push({ level, msg });
+		};
+
+		const result = await runTurn(
+			makeRunOpts(ctx, "sap-clean", { runtime, _spawnFn: spawnFn, _logWarning: logger }),
+		);
+
+		expect(result.cleanResult).toBe(true);
+		// No terminal mail was sent — but for an event-signaling runtime that is
+		// NOT a contract violation.
+		expect(result.terminalMailObserved).toBe(false);
+		expect(result.terminalMailMissing).toBe(false);
+		expect(result.finalState).toBe("completed");
+
+		const after = readSession(ctx.sessionsDbPath, "sap-clean");
+		expect(after?.state).toBe("completed");
+
+		// The "exited cleanly without sending terminal mail" error must NOT fire.
+		const violation = logged.find((l) => l.msg.includes("without sending terminal mail"));
+		expect(violation).toBeUndefined();
+	});
+
+	test("event-signaling runtime: clean result does NOT emit worker_died to parent", async () => {
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "sap-child",
+			state: "working",
+			parentAgent: "lead-sap",
+			taskId: "task-sap",
+		});
+		const { runtime } = makeEventSignalingRuntime();
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			emitFakeTurn(fake, { sessionId: "sap-child-sess", isError: false });
+			fake._exit(0);
+			return fake;
+		};
+
+		const sharedMail = createMailStore(ctx.mailDbPath);
+		try {
+			const result = await runTurn({
+				...makeRunOpts(ctx, "sap-child", { runtime, _spawnFn: spawnFn }),
+				_mailStore: sharedMail,
+			});
+
+			expect(result.finalState).toBe("completed");
+			expect(result.terminalMailMissing).toBe(false);
+
+			// The lead must NOT be told its worker died — the clean result is the
+			// terminal signal.
+			const inbox = sharedMail.getAll({ to: "lead-sap", type: "worker_died" });
+			expect(inbox.length).toBe(0);
+		} finally {
+			sharedMail.close();
+		}
+	});
+
+	test("event-signaling runtime: result.isError=true is NOT terminal (no false completion)", async () => {
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "sap-err",
+			state: "working",
+			parentAgent: "lead-sap-err",
+			taskId: "task-sap-err",
+		});
+		const { runtime } = makeEventSignalingRuntime();
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			// is_error=true → cleanResult stays false → completedViaEvents false.
+			emitFakeTurn(fake, { sessionId: "sap-err-sess", isError: true });
+			fake._exit(1);
+			return fake;
+		};
+
+		const result = await runTurn(makeRunOpts(ctx, "sap-err", { runtime, _spawnFn: spawnFn }));
+
+		expect(result.cleanResult).toBe(false);
+		// An errored result is not a clean completion — must not settle to completed.
+		expect(result.finalState).not.toBe("completed");
+		expect(result.terminalMailMissing).toBe(false);
+	});
+
+	test("production SaplingRuntime carries signalsCompletionViaEvents=true (the contract)", () => {
+		expect(new SaplingRuntime().signalsCompletionViaEvents).toBe(true);
 	});
 
 	// --- Resume-path parent-notify (overstory-de3c) ---
