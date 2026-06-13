@@ -34,8 +34,10 @@ import type {
 	AgentState,
 	EventStore,
 	EventType,
+	MailMessageType,
 	ResolvedModel,
 	WorkerDiedPayload,
+	WorkerDonePayload,
 } from "../types.ts";
 import { terminalMailTypesFor } from "./capabilities.ts";
 import { detectMailPollPattern } from "./mail-poll-detect.ts";
@@ -495,6 +497,104 @@ function notifyParentOfRunnerDeath(ctx: {
 }
 
 /**
+ * Synthesize the capability's TERMINAL SUCCESS mail to the parent on behalf of
+ * an event-signaling worker (sapling, post Warren-decoupling) that completed
+ * cleanly via its NDJSON `result` event and made NO outbound `ov mail` calls.
+ *
+ * A spawn-per-turn LEAD parent is woken by its child's terminal mail. With a
+ * sapling child sending none (decoupled) and the runner suppressing the fake
+ * `worker_died`, the lead would otherwise stay `between_turns` forever (hang).
+ * ov therefore synthesizes the SAME mail a claude worker would have sent —
+ * `worker_done` for builder/scout/reviewer/lead, `merged` for merger — FROM the
+ * worker TO its parent, so the lead's mail-wake fires (overstory: sapling
+ * parent wake-up). The original Codex guidance was explicit: synthesize the
+ * success signal ov-side; do NOT make sapling emit ov mail.
+ *
+ * Only called when a parent exists — a top-level `ov sling` with no parent
+ * needs no mail and already completes. Fire-and-forget: every failure surfaces
+ * through `runnerLog` and never propagates; mail-send must not break the turn.
+ */
+function notifyParentOfEventCompletion(ctx: {
+	mailStore: MailStore | null;
+	mailDbPath: string;
+	parentAgent: string;
+	agentName: string;
+	capability: string;
+	taskId: string;
+	branchName: string;
+	exitCode: number | null;
+	runnerLog: RunnerLogger;
+}): void {
+	const {
+		mailStore,
+		mailDbPath,
+		parentAgent,
+		agentName,
+		capability,
+		taskId,
+		branchName,
+		exitCode,
+		runnerLog,
+	} = ctx;
+
+	// First terminal type for the capability is the SUCCESS signal:
+	// worker_done (builder/scout/reviewer/lead) or merged (merger). A clean
+	// event-completion is unambiguously success, so never the failure variant.
+	const terminalType = terminalMailTypesFor(capability)[0];
+	if (!terminalType) {
+		// No terminal mail type for this capability — nothing to synthesize.
+		return;
+	}
+
+	// Mirror the WorkerDonePayload a claude worker would have sent.
+	const payload: WorkerDonePayload = {
+		taskId,
+		branch: branchName,
+		exitCode: exitCode ?? 0,
+		filesModified: [],
+	};
+	const subject = `Worker done: ${taskId}`;
+	const body =
+		`Worker "${agentName}" (${capability}) completed task ${taskId} via its ` +
+		`event stream (clean result). Synthesized terminal signal so the parent wakes.`;
+
+	let store: MailStore | null = mailStore;
+	let owned = false;
+	if (store === null) {
+		try {
+			store = createMailStore(mailDbPath);
+			owned = true;
+		} catch (err) {
+			runnerLog("warn", "failed to open mail store for parent event-completion notify", err);
+			return;
+		}
+	}
+	try {
+		store.insert({
+			id: "",
+			from: agentName,
+			to: parentAgent,
+			subject,
+			body,
+			type: terminalType as MailMessageType,
+			priority: "normal",
+			threadId: null,
+			payload: JSON.stringify(payload),
+		});
+	} catch (err) {
+		runnerLog("warn", "failed to synthesize terminal mail to parent", err);
+	} finally {
+		if (owned) {
+			try {
+				store.close();
+			} catch {
+				// best-effort
+			}
+		}
+	}
+}
+
+/**
  * Guarded state transition for the turn runner. Uses the SessionStore CAS
  * (`tryTransitionState`) so a concurrent writer — `ov stop` writing
  * `completed`, watchdog writing `zombie` — cannot be silently overwritten
@@ -726,6 +826,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 	let initialState: AgentState = preInitialState;
 	let priorSessionId: string | null = null;
 	let parentAgent: string | null = null;
+	let branchName: string | null = null;
 	let sessionLastActivity: string | null = null;
 	let turnPidPath: string | null = null;
 	// Per-turn diagnostic sink. Bound after the turn log dir is created;
@@ -744,6 +845,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 					initialState = session.state;
 					priorSessionId = session.claudeSessionId ?? null;
 					parentAgent = session.parentAgent ?? null;
+					branchName = session.branchName ?? null;
 					sessionLastActivity = session.lastActivity ?? null;
 				}
 			} finally {
@@ -1341,6 +1443,31 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 				taskId,
 				reason,
 				lastActivity: sessionLastActivity ?? new Date(startedAtMs).toISOString(),
+				runnerLog,
+			});
+		}
+
+		// In-band parent wake-up for event-signaling runtimes (sapling). When the
+		// worker completed cleanly via its `result` event (completedViaEvents) and
+		// has a parent, it sent NO terminal `ov mail` itself — so ov synthesizes the
+		// capability's terminal SUCCESS mail (worker_done / merged) FROM the worker
+		// TO its parent. Without this, a spawn-per-turn lead waits forever for a
+		// signal that will never arrive (the suppressed fake worker_died was at
+		// least a wake, but a wrong one; the synthesized success is correct). This
+		// is mutually exclusive with the worker_died path above — an event-completed
+		// turn is neither `zombie` nor `terminalMailMissing` — so there is no
+		// double-signal. The claude path leaves `completedViaEvents` false and is
+		// unaffected (no double-mail on top of the worker's own terminal mail).
+		if (completedViaEvents && parentAgent !== null) {
+			notifyParentOfEventCompletion({
+				mailStore: opts._mailStore ?? null,
+				mailDbPath,
+				parentAgent,
+				agentName,
+				capability,
+				taskId,
+				branchName: branchName ?? "",
+				exitCode,
 				runnerLog,
 			});
 		}

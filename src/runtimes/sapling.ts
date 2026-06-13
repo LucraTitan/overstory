@@ -81,6 +81,39 @@ const NON_IMPLEMENTATION_CAPABILITIES = new Set([
 const COORDINATION_CAPABILITIES = new Set(["coordinator", "orchestrator", "supervisor", "monitor"]);
 
 /**
+ * Normalize a sapling terminal `result` event so the runtime-agnostic
+ * turn-runner completion check (`cleanResult = event.isError !== true`) is
+ * correct for sapling's real event shape.
+ *
+ * LIVE sapling emits its final result as:
+ *   { type: "result", outcome: "success" | "max_turns" | "error", summary,
+ *     totalTurns, totalInputTokens, totalOutputTokens }
+ * (https://github.com/jayminwest/sapling/blob/main/src/hooks/events.ts).
+ *
+ * Critically, that event carries NO `isError` field — the success/failure
+ * discriminator is `outcome`. Without normalization, `event.isError !== true`
+ * is vacuously true for an `outcome:"error"` (or `"max_turns"`) result, so an
+ * ERRORED sapling task would set `cleanResult=true` → `completedViaEvents=true`
+ * → FALSE completion (a failure reported upstream as success).
+ *
+ * This derives `isError` from `outcome` for result events: a clean completion
+ * requires `outcome === "success"`; `"error"` and `"max_turns"` are failures.
+ * Backward-compat rules (immutability preserved — returns a new object, never
+ * mutates the input):
+ * - An explicit `isError` already on the event WINS (claude-shaped results and
+ *   any future sapling shape that sets it pass through untouched).
+ * - A result event with neither `outcome` nor `isError` is returned unchanged.
+ * - Non-`result` events are never touched, even if they carry an `outcome`.
+ */
+function normalizeResultEvent(event: AgentEvent): AgentEvent {
+	if (event.type !== "result") return event;
+	// An explicit discriminator already present — respect it.
+	if ("isError" in event) return event;
+	if (typeof event.outcome !== "string") return event;
+	return { ...event, isError: event.outcome !== "success" };
+}
+
+/**
  * Build the full guards configuration object for .sapling/guards.json.
  *
  * Translates overstory guard-rules.ts constants and HooksDef fields into a
@@ -643,7 +676,7 @@ export class SaplingRuntime implements AgentRuntime {
 					if (!trimmed) continue;
 
 					try {
-						const event = JSON.parse(trimmed) as AgentEvent;
+						const event = normalizeResultEvent(JSON.parse(trimmed) as AgentEvent);
 						yield event;
 					} catch {
 						// Skip malformed lines — partial writes or debug output.
@@ -655,7 +688,7 @@ export class SaplingRuntime implements AgentRuntime {
 			const remaining = buffer.trim();
 			if (remaining) {
 				try {
-					const event = JSON.parse(remaining) as AgentEvent;
+					const event = normalizeResultEvent(JSON.parse(remaining) as AgentEvent);
 					yield event;
 				} catch {
 					// Skip malformed trailing line.

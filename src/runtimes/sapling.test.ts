@@ -1210,6 +1210,101 @@ describe("SaplingRuntime", () => {
 			const events = await collectEvents(stream);
 			expect(events[0]).toEqual(event);
 		});
+
+		// --- outcome → isError normalization (overstory: errored sapling result
+		// must not false-complete) ---
+		//
+		// LIVE sapling emits a terminal result event shaped:
+		//   { type: "result", outcome: "success" | "max_turns" | "error", summary,
+		//     totalTurns, totalInputTokens, totalOutputTokens }
+		// (https://github.com/jayminwest/sapling/blob/main/src/hooks/events.ts).
+		// There is NO `isError` field. The turn-runner derives `cleanResult` from
+		// `event.isError !== true`, so without normalization an `outcome:"error"`
+		// result (no isError) would be treated as a CLEAN completion and the
+		// failure would be reported up as success. parseEvents normalizes the
+		// discriminator: clean completion requires `outcome === "success"`.
+
+		test("result with outcome:'error' is normalized to isError:true (no false-complete)", async () => {
+			const event = {
+				type: "result",
+				outcome: "error",
+				summary: "task failed",
+				totalTurns: 3,
+				totalInputTokens: 100,
+				totalOutputTokens: 50,
+			};
+			const stream = makeStream([`${JSON.stringify(event)}\n`]);
+			const events = await collectEvents(stream);
+			expect(events).toHaveLength(1);
+			expect(events[0]?.isError).toBe(true);
+			// Original fields are preserved alongside the derived discriminator.
+			expect(events[0]?.outcome).toBe("error");
+			expect(events[0]?.summary).toBe("task failed");
+		});
+
+		test("result with outcome:'max_turns' is normalized to isError:true (not a clean success)", async () => {
+			const event = {
+				type: "result",
+				outcome: "max_turns",
+				summary: "hit turn limit",
+				totalTurns: 50,
+				totalInputTokens: 1,
+				totalOutputTokens: 1,
+			};
+			const stream = makeStream([`${JSON.stringify(event)}\n`]);
+			const events = await collectEvents(stream);
+			expect(events[0]?.isError).toBe(true);
+		});
+
+		test("result with outcome:'success' is normalized to isError:false (still completes)", async () => {
+			const event = {
+				type: "result",
+				outcome: "success",
+				summary: "done",
+				totalTurns: 4,
+				totalInputTokens: 200,
+				totalOutputTokens: 80,
+			};
+			const stream = makeStream([`${JSON.stringify(event)}\n`]);
+			const events = await collectEvents(stream);
+			expect(events[0]?.isError).toBe(false);
+			expect(events[0]?.outcome).toBe("success");
+		});
+
+		test("explicit isError on a result event wins over outcome (backward-compat)", async () => {
+			// If a future sapling/claude-shaped result already carries isError, the
+			// normalizer must not clobber it — even when outcome disagrees.
+			const event = {
+				type: "result",
+				outcome: "success",
+				isError: true,
+			};
+			const stream = makeStream([`${JSON.stringify(event)}\n`]);
+			const events = await collectEvents(stream);
+			expect(events[0]?.isError).toBe(true);
+		});
+
+		test("result event without outcome or isError is left unchanged", async () => {
+			// Claude-shaped / generic result events have no `outcome`; the
+			// normalizer must not inject a spurious isError that would change
+			// downstream level/clean-result derivation.
+			const event = { type: "result", timestamp: "2025-01-01T00:00:00Z" };
+			const stream = makeStream([`${JSON.stringify(event)}\n`]);
+			const events = await collectEvents(stream);
+			expect(events[0]).toEqual(event);
+			expect(events[0]?.isError).toBeUndefined();
+		});
+
+		test("non-result events with an outcome field are not normalized", async () => {
+			// Only the terminal `result` event carries the success/error
+			// discriminator; an unrelated event that happens to have `outcome`
+			// must pass through untouched.
+			const event = { type: "tool_end", timestamp: "2025-01-01T00:00:00Z", outcome: "whatever" };
+			const stream = makeStream([`${JSON.stringify(event)}\n`]);
+			const events = await collectEvents(stream);
+			expect(events[0]).toEqual(event);
+			expect(events[0]?.isError).toBeUndefined();
+		});
 	});
 
 	describe("connect()", () => {

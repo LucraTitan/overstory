@@ -1204,6 +1204,161 @@ describe("runTurn", () => {
 		}
 	});
 
+	test("event-signaling runtime: clean result SYNTHESIZES the terminal mail to the parent (lead wake-up)", async () => {
+		// HIGH #1: a sapling child sends no ov mail (decoupled), and the runner now
+		// suppresses the fake worker_died. Without a replacement signal, a
+		// spawn-per-turn LEAD parent waits forever for its child's terminal mail.
+		// ov must synthesize the capability's terminal mail (worker_done) FROM the
+		// child TO its parent so the lead's mail-wake fires.
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "sap-wake",
+			state: "working",
+			parentAgent: "lead-wake",
+			capability: "builder",
+			taskId: "task-wake",
+			branchName: "agent/sap-wake",
+		});
+		const { runtime } = makeEventSignalingRuntime();
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			emitFakeTurn(fake, { sessionId: "sap-wake-sess", isError: false });
+			fake._exit(0);
+			return fake;
+		};
+
+		const sharedMail = createMailStore(ctx.mailDbPath);
+		try {
+			const result = await runTurn({
+				...makeRunOpts(ctx, "sap-wake", { runtime, _spawnFn: spawnFn, capability: "builder" }),
+				_mailStore: sharedMail,
+			});
+
+			expect(result.finalState).toBe("completed");
+
+			// The parent must receive the SYNTHESIZED worker_done (the same terminal
+			// mail a claude worker would have sent), from the child, so the lead wakes.
+			const inbox = sharedMail.getAll({ to: "lead-wake", type: "worker_done" });
+			expect(inbox.length).toBe(1);
+			const msg = inbox[0];
+			expect(msg?.from).toBe("sap-wake");
+			expect(msg?.to).toBe("lead-wake");
+			// Payload mirrors WorkerDonePayload so downstream consumers parse it.
+			// taskId is the runner's authoritative task id (from run opts), and
+			// branch is read from the session row.
+			const payload = JSON.parse(msg?.payload ?? "{}") as Record<string, unknown>;
+			expect(payload.taskId).toBe("task-test");
+			expect(payload.branch).toBe("agent/sap-wake");
+			expect(payload.exitCode).toBe(0);
+
+			// And it must NOT also emit a worker_died (no contradictory double-signal).
+			const died = sharedMail.getAll({ to: "lead-wake", type: "worker_died" });
+			expect(died.length).toBe(0);
+		} finally {
+			sharedMail.close();
+		}
+	});
+
+	test("event-signaling runtime: merger child synthesizes 'merged' (capability-correct terminal type)", async () => {
+		// terminalMailTypesFor(merger) = [merged, merge_failed]; the synthesized
+		// terminal mail must use the FIRST (success) type for the capability.
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "sap-merge",
+			state: "working",
+			parentAgent: "lead-merge",
+			capability: "merger",
+			taskId: "task-merge",
+			branchName: "agent/sap-merge",
+		});
+		const { runtime } = makeEventSignalingRuntime();
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			emitFakeTurn(fake, { sessionId: "sap-merge-sess", isError: false });
+			fake._exit(0);
+			return fake;
+		};
+
+		const sharedMail = createMailStore(ctx.mailDbPath);
+		try {
+			const result = await runTurn({
+				...makeRunOpts(ctx, "sap-merge", { runtime, _spawnFn: spawnFn, capability: "merger" }),
+				_mailStore: sharedMail,
+			});
+			expect(result.finalState).toBe("completed");
+			const merged = sharedMail.getAll({ to: "lead-merge", type: "merged" });
+			expect(merged.length).toBe(1);
+			expect(merged[0]?.from).toBe("sap-merge");
+		} finally {
+			sharedMail.close();
+		}
+	});
+
+	test("event-signaling runtime: NO parent → no synthesized mail, still completed", async () => {
+		// Top-level `ov sling` with no parent needs no mail (nobody to wake) and
+		// already completes — preserve that. No worker_done, no worker_died.
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "sap-noparent",
+			state: "working",
+			parentAgent: null,
+			capability: "builder",
+			taskId: "task-np",
+		});
+		const { runtime } = makeEventSignalingRuntime();
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			emitFakeTurn(fake, { sessionId: "sap-np-sess", isError: false });
+			fake._exit(0);
+			return fake;
+		};
+
+		const sharedMail = createMailStore(ctx.mailDbPath);
+		try {
+			const result = await runTurn({
+				...makeRunOpts(ctx, "sap-noparent", { runtime, _spawnFn: spawnFn }),
+				_mailStore: sharedMail,
+			});
+			expect(result.finalState).toBe("completed");
+			// No terminal mail synthesized for a parentless worker.
+			const done = sharedMail.getAll({ type: "worker_done" });
+			expect(done.length).toBe(0);
+			const died = sharedMail.getAll({ type: "worker_died" });
+			expect(died.length).toBe(0);
+		} finally {
+			sharedMail.close();
+		}
+	});
+
+	test("event-signaling runtime: errored result with a parent does NOT synthesize a worker_done", async () => {
+		// completedViaEvents must be false when the result is not clean; an errored
+		// sapling child must not have a fake success mail synthesized for it.
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "sap-wake-err",
+			state: "working",
+			parentAgent: "lead-wake-err",
+			capability: "builder",
+			taskId: "task-wake-err",
+		});
+		const { runtime } = makeEventSignalingRuntime();
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			emitFakeTurn(fake, { sessionId: "sap-wake-err-sess", isError: true });
+			fake._exit(1);
+			return fake;
+		};
+
+		const sharedMail = createMailStore(ctx.mailDbPath);
+		try {
+			const result = await runTurn({
+				...makeRunOpts(ctx, "sap-wake-err", { runtime, _spawnFn: spawnFn }),
+				_mailStore: sharedMail,
+			});
+			expect(result.finalState).not.toBe("completed");
+			const done = sharedMail.getAll({ to: "lead-wake-err", type: "worker_done" });
+			expect(done.length).toBe(0);
+		} finally {
+			sharedMail.close();
+		}
+	});
+
 	test("event-signaling runtime: result.isError=true is NOT terminal (no false completion)", async () => {
 		seedSession(ctx.sessionsDbPath, {
 			agentName: "sap-err",
