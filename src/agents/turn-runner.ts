@@ -34,8 +34,12 @@ import type {
 	AgentState,
 	EventStore,
 	EventType,
+	MailMessageType,
+	MergedPayload,
+	ResolutionTier,
 	ResolvedModel,
 	WorkerDiedPayload,
+	WorkerDonePayload,
 } from "../types.ts";
 import { terminalMailTypesFor } from "./capabilities.ts";
 import { detectMailPollPattern } from "./mail-poll-detect.ts";
@@ -495,6 +499,127 @@ function notifyParentOfRunnerDeath(ctx: {
 }
 
 /**
+ * Synthesize the capability's TERMINAL SUCCESS mail to the parent on behalf of
+ * an event-signaling worker (sapling, post Warren-decoupling) that completed
+ * cleanly via its NDJSON `result` event and made NO outbound `ov mail` calls.
+ *
+ * A spawn-per-turn LEAD parent is woken by its child's terminal mail. With a
+ * sapling child sending none (decoupled) and the runner suppressing the fake
+ * `worker_died`, the lead would otherwise stay `between_turns` forever (hang).
+ * ov therefore synthesizes the SAME mail a claude worker would have sent —
+ * `worker_done` (WorkerDonePayload) for builder/scout/reviewer/lead, `merged`
+ * (MergedPayload) for merger — FROM the worker TO its parent, so the lead's
+ * mail-wake fires (overstory: sapling parent wake-up). The payload SHAPE is
+ * capability-correct: a `merged` mail carries { branch, taskId, tier }, not a
+ * WorkerDonePayload, so the merge layer parses it. The original Codex guidance
+ * was explicit: synthesize the success signal ov-side; do NOT make sapling emit
+ * ov mail.
+ *
+ * Only called when a parent exists — a top-level `ov sling` with no parent
+ * needs no mail and already completes. Fire-and-forget: every failure surfaces
+ * through `runnerLog` and never propagates; mail-send must not break the turn.
+ */
+function notifyParentOfEventCompletion(ctx: {
+	mailStore: MailStore | null;
+	mailDbPath: string;
+	parentAgent: string;
+	agentName: string;
+	capability: string;
+	taskId: string;
+	branchName: string;
+	exitCode: number | null;
+	runnerLog: RunnerLogger;
+}): void {
+	const {
+		mailStore,
+		mailDbPath,
+		parentAgent,
+		agentName,
+		capability,
+		taskId,
+		branchName,
+		exitCode,
+		runnerLog,
+	} = ctx;
+
+	// First terminal type for the capability is the SUCCESS signal:
+	// worker_done (builder/scout/reviewer/lead) or merged (merger). A clean
+	// event-completion is unambiguously success, so never the failure variant.
+	const terminalType = terminalMailTypesFor(capability)[0];
+	if (!terminalType) {
+		// No terminal mail type for this capability — nothing to synthesize.
+		return;
+	}
+
+	// Build the CAPABILITY-CORRECT payload for the terminal type. A `merged`
+	// signal must carry a MergedPayload ({ branch, taskId, tier }); a
+	// `worker_done` carries a WorkerDonePayload. Sending the wrong shape (e.g. a
+	// WorkerDonePayload under a `merged` type) breaks any consumer that parses by
+	// type — the merge layer expects `tier`, not `exitCode`/`filesModified`.
+	let payload: WorkerDonePayload | MergedPayload;
+	let subject: string;
+	let body: string;
+	if (terminalType === "merged") {
+		// ov has no conflict-resolution telemetry for an event-signaled merger; a
+		// clean event-completion is, from ov's POV, a clean merge — mirror the
+		// `tier: "clean-merge"` a Tier-1 clean merge sets in merge/resolver.ts.
+		const tier: ResolutionTier = "clean-merge";
+		payload = { branch: branchName, taskId, tier };
+		subject = `Merged: ${taskId}`;
+		body =
+			`Worker "${agentName}" (merger) completed task ${taskId} via its event ` +
+			`stream (clean result). Synthesized terminal 'merged' signal (tier ${tier}) so the parent wakes.`;
+	} else {
+		// Mirror the WorkerDonePayload a claude worker would have sent.
+		payload = {
+			taskId,
+			branch: branchName,
+			exitCode: exitCode ?? 0,
+			filesModified: [],
+		};
+		subject = `Worker done: ${taskId}`;
+		body =
+			`Worker "${agentName}" (${capability}) completed task ${taskId} via its ` +
+			`event stream (clean result). Synthesized terminal signal so the parent wakes.`;
+	}
+
+	let store: MailStore | null = mailStore;
+	let owned = false;
+	if (store === null) {
+		try {
+			store = createMailStore(mailDbPath);
+			owned = true;
+		} catch (err) {
+			runnerLog("warn", "failed to open mail store for parent event-completion notify", err);
+			return;
+		}
+	}
+	try {
+		store.insert({
+			id: "",
+			from: agentName,
+			to: parentAgent,
+			subject,
+			body,
+			type: terminalType as MailMessageType,
+			priority: "normal",
+			threadId: null,
+			payload: JSON.stringify(payload),
+		});
+	} catch (err) {
+		runnerLog("warn", "failed to synthesize terminal mail to parent", err);
+	} finally {
+		if (owned) {
+			try {
+				store.close();
+			} catch {
+				// best-effort
+			}
+		}
+	}
+}
+
+/**
  * Guarded state transition for the turn runner. Uses the SessionStore CAS
  * (`tryTransitionState`) so a concurrent writer — `ov stop` writing
  * `completed`, watchdog writing `zombie` — cannot be silently overwritten
@@ -726,6 +851,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 	let initialState: AgentState = preInitialState;
 	let priorSessionId: string | null = null;
 	let parentAgent: string | null = null;
+	let branchName: string | null = null;
 	let sessionLastActivity: string | null = null;
 	let turnPidPath: string | null = null;
 	// Per-turn diagnostic sink. Bound after the turn log dir is created;
@@ -744,6 +870,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 					initialState = session.state;
 					priorSessionId = session.claudeSessionId ?? null;
 					parentAgent = session.parentAgent ?? null;
+					branchName = session.branchName ?? null;
 					sessionLastActivity = session.lastActivity ?? null;
 				}
 			} finally {
@@ -1315,16 +1442,113 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 			);
 		}
 
-		// In-band parent notification (overstory-4159, overstory-c772). When the
-		// turn ends without the capability's terminal mail — either because the
-		// runner zombified (abort/stall) or claude exited cleanly without sending
-		// `worker_done` — synthesize a `worker_died` mail to the parent so the
-		// lead does not block forever waiting for a signal that will never come.
-		// The watchdog's pre-tick state-snapshot dedup (mx-b0e54b) ensures a
-		// later watchdog pass on the now-zombie session does not re-fire.
-		const shouldNotifyParent =
-			parentAgent !== null && (finalState === "zombie" || terminalMailMissing);
-		if (shouldNotifyParent && parentAgent !== null) {
+		// ── Single parent-wake decision (overstory: sapling parent wake) ──
+		//
+		// INVARIANT: for a turn with a parent, ov synthesizes EXACTLY ONE parent
+		// signal on EVERY terminal path — never zero (the parent hangs), never two
+		// (contradictory double-signal). The three sources below are MUTUALLY
+		// EXCLUSIVE:
+		//
+		//   (1) event-signaled SUCCESS  → terminal success mail (worker_done/merged)
+		//   (2) event-signaled FAILURE  → worker_died (the child's process ended
+		//                                 without a clean success — a failing
+		//                                 `result` OR a non-clean exit with no
+		//                                 result at all; success synthesis won't
+		//                                 fire and the death path below would
+		//                                 otherwise miss it because the turn is
+		//                                 neither zombie nor terminalMailMissing —
+		//                                 so the lead would hang)
+		//   (3) death / silent-no-op    → worker_died (zombie abort/stall, or a
+		//                                 clean exit with no terminal mail)
+		//
+		// Mutual exclusion is enforced purely by the `!synthesizeEventSuccess &&
+		// !synthesizeEventFailure` guards on the death path below — whichever of
+		// (1)/(2) fires for an event-signaling runtime excludes (3). The death path
+		// (3) still correctly fires for an event-signaling turn that ABORTED/STALLED
+		// (zombie) before reporting a clean/failed result, where neither (1) nor (2)
+		// applies — so an aborted sapling worker is never left without a wake. A
+		// non-event-signaling runtime (claude) leaves completedViaEvents false and
+		// never reports failure via (2) (its errored turns flow through the existing
+		// death/zombie path unchanged).
+		const isEventSignaling = runtime.signalsCompletionViaEvents === true;
+
+		// (1) event-signaled SUCCESS. Gated on !terminalMailObserved so we never
+		// double up on a worker that ALSO sent its own terminal mail this turn.
+		const synthesizeEventSuccess =
+			parentAgent !== null && completedViaEvents && !terminalMailObserved;
+
+		// (2) event-signaled FAILURE. An event-signaling runtime (sapling) is
+		// one-shot per turn: when its process exits without a CLEAN success it is a
+		// terminal failure, with no "next mail batch" coming. This covers BOTH a
+		// failing `result` (outcome error/max_turns → !cleanResult) AND a process
+		// that died/exited non-cleanly WITHOUT ever emitting a `result` (also
+		// !cleanResult) — the latter is the zero-wake gap a result-only guard would
+		// miss. Excludes the abort/stall zombie path (handled by (3) as a death) and
+		// the success path. Gated on !terminalMailObserved (symmetric with (1)): if
+		// the worker DID send its own terminal mail this turn the parent is already
+		// woken by it, so synthesizing a worker_died on top would be a contradictory
+		// double-signal. Otherwise the child sends no terminal mail of its own, so
+		// ov wakes the parent with worker_died so the lead can retry/escalate
+		// instead of hanging.
+		const synthesizeEventFailure =
+			parentAgent !== null &&
+			isEventSignaling &&
+			!synthesizeEventSuccess &&
+			!terminalMailObserved &&
+			!cleanResult &&
+			!aborted &&
+			!stallAborted;
+
+		// (3) death / silent-no-op worker_died. Fires only when neither event-wake
+		// (1)/(2) owns the signal — guaranteeing exactly one parent signal.
+		const shouldNotifyParentDeath =
+			parentAgent !== null &&
+			!synthesizeEventSuccess &&
+			!synthesizeEventFailure &&
+			(finalState === "zombie" || terminalMailMissing);
+
+		if (synthesizeEventSuccess && parentAgent !== null) {
+			// In-band parent wake-up for event-signaling runtimes (sapling). The
+			// worker completed cleanly via its `result` event and sent NO terminal
+			// `ov mail` itself — so ov synthesizes the capability's terminal SUCCESS
+			// mail (worker_done / merged) FROM the worker TO its parent.
+			notifyParentOfEventCompletion({
+				mailStore: opts._mailStore ?? null,
+				mailDbPath,
+				parentAgent,
+				agentName,
+				capability,
+				taskId,
+				branchName: branchName ?? "",
+				exitCode,
+				runnerLog,
+			});
+		} else if (synthesizeEventFailure && parentAgent !== null) {
+			// In-band parent wake-up on an event-signaled FAILURE. Mirror
+			// notifyParentOfRunnerDeath's worker_died payload/shape so the lead's
+			// existing worker_died handling fires and it can retry/escalate/report.
+			const failReason =
+				exitCode !== null && exitCode !== 0
+					? `Event-signaling runtime process exited ${exitCode} without a clean result`
+					: "Event-signaling runtime ended without a clean success result (failing result or no result)";
+			notifyParentOfRunnerDeath({
+				mailStore: opts._mailStore ?? null,
+				mailDbPath,
+				parentAgent,
+				agentName,
+				capability,
+				taskId,
+				reason: failReason,
+				lastActivity: sessionLastActivity ?? new Date(startedAtMs).toISOString(),
+				runnerLog,
+			});
+		} else if (shouldNotifyParentDeath && parentAgent !== null) {
+			// In-band parent notification (overstory-4159, overstory-c772). The turn
+			// ended without the capability's terminal mail — either the runner
+			// zombified (abort/stall) or claude exited cleanly without sending
+			// `worker_done` — so synthesize a `worker_died` mail to the parent. The
+			// watchdog's pre-tick state-snapshot dedup (mx-b0e54b) ensures a later
+			// watchdog pass on the now-zombie session does not re-fire.
 			const reason = aborted
 				? "Aborted by operator (SIGTERM)"
 				: stallAborted

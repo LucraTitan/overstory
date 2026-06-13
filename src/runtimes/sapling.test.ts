@@ -1158,7 +1158,9 @@ describe("SaplingRuntime", () => {
 		});
 
 		test("skips malformed lines", async () => {
-			const good = { type: "result", timestamp: "2025-01-01T00:00:00Z" };
+			// Use a non-`result` event so this exercises parsing mechanics only,
+			// without triggering result-event normalization.
+			const good = { type: "tool_end", timestamp: "2025-01-01T00:00:00Z" };
 			const stream = makeStream([`not json\n${JSON.stringify(good)}\n`]);
 			const events = await collectEvents(stream);
 			expect(events).toHaveLength(1);
@@ -1173,7 +1175,8 @@ describe("SaplingRuntime", () => {
 		});
 
 		test("handles chunked data spanning multiple reads", async () => {
-			const event = { type: "result", timestamp: "2025-01-01T00:00:00Z", data: "hello" };
+			// Non-`result` type: this asserts chunk reassembly, not normalization.
+			const event = { type: "tool_end", timestamp: "2025-01-01T00:00:00Z", data: "hello" };
 			const full = `${JSON.stringify(event)}\n`;
 			// Split across three chunks
 			const mid = Math.floor(full.length / 2);
@@ -1184,7 +1187,8 @@ describe("SaplingRuntime", () => {
 		});
 
 		test("handles trailing data without newline", async () => {
-			const event = { type: "result", timestamp: "2025-01-01T00:00:00Z" };
+			// Non-`result` type: asserts trailing-line flush, not normalization.
+			const event = { type: "tool_end", timestamp: "2025-01-01T00:00:00Z" };
 			// No trailing newline
 			const stream = makeStream([JSON.stringify(event)]);
 			const events = await collectEvents(stream);
@@ -1209,6 +1213,127 @@ describe("SaplingRuntime", () => {
 			const stream = makeStream([`${JSON.stringify(event)}\n`]);
 			const events = await collectEvents(stream);
 			expect(events[0]).toEqual(event);
+		});
+
+		// --- outcome → isError normalization (overstory: errored sapling result
+		// must not false-complete) ---
+		//
+		// LIVE sapling emits a terminal result event shaped:
+		//   { type: "result", outcome: "success" | "max_turns" | "error", summary,
+		//     totalTurns, totalInputTokens, totalOutputTokens }
+		// (https://github.com/jayminwest/sapling/blob/main/src/hooks/events.ts).
+		// There is NO `isError` field. The turn-runner derives `cleanResult` from
+		// `event.isError !== true`, so without normalization an `outcome:"error"`
+		// result (no isError) would be treated as a CLEAN completion and the
+		// failure would be reported up as success. parseEvents normalizes the
+		// discriminator: clean completion requires `outcome === "success"`.
+
+		test("result with outcome:'error' is normalized to isError:true (no false-complete)", async () => {
+			const event = {
+				type: "result",
+				outcome: "error",
+				summary: "task failed",
+				totalTurns: 3,
+				totalInputTokens: 100,
+				totalOutputTokens: 50,
+			};
+			const stream = makeStream([`${JSON.stringify(event)}\n`]);
+			const events = await collectEvents(stream);
+			expect(events).toHaveLength(1);
+			expect(events[0]?.isError).toBe(true);
+			// Original fields are preserved alongside the derived discriminator.
+			expect(events[0]?.outcome).toBe("error");
+			expect(events[0]?.summary).toBe("task failed");
+		});
+
+		test("result with outcome:'max_turns' is normalized to isError:true (not a clean success)", async () => {
+			const event = {
+				type: "result",
+				outcome: "max_turns",
+				summary: "hit turn limit",
+				totalTurns: 50,
+				totalInputTokens: 1,
+				totalOutputTokens: 1,
+			};
+			const stream = makeStream([`${JSON.stringify(event)}\n`]);
+			const events = await collectEvents(stream);
+			expect(events[0]?.isError).toBe(true);
+		});
+
+		test("result with outcome:'success' is normalized to isError:false (still completes)", async () => {
+			const event = {
+				type: "result",
+				outcome: "success",
+				summary: "done",
+				totalTurns: 4,
+				totalInputTokens: 200,
+				totalOutputTokens: 80,
+			};
+			const stream = makeStream([`${JSON.stringify(event)}\n`]);
+			const events = await collectEvents(stream);
+			expect(events[0]?.isError).toBe(false);
+			expect(events[0]?.outcome).toBe("success");
+		});
+
+		test("explicit isError:true on a result event wins over outcome (backward-compat)", async () => {
+			// If a future sapling/claude-shaped result already carries isError, the
+			// normalizer must not clobber it — even when outcome disagrees.
+			const event = {
+				type: "result",
+				outcome: "success",
+				isError: true,
+			};
+			const stream = makeStream([`${JSON.stringify(event)}\n`]);
+			const events = await collectEvents(stream);
+			expect(events[0]?.isError).toBe(true);
+		});
+
+		test("explicit isError:false on a result event wins (clean, no outcome)", async () => {
+			// An explicit isError:false is a recognizable success discriminator; the
+			// normalizer must keep it clean and NOT fail closed.
+			const event = {
+				type: "result",
+				timestamp: "2025-01-01T00:00:00Z",
+				isError: false,
+			};
+			const stream = makeStream([`${JSON.stringify(event)}\n`]);
+			const events = await collectEvents(stream);
+			expect(events[0]?.isError).toBe(false);
+		});
+
+		test("result event with NEITHER a string outcome NOR explicit isError FAILS CLOSED (isError:true)", async () => {
+			// Non-blocking 2: a malformed sapling result lacking any recognizable
+			// success discriminator must NOT be treated as a clean completion. Failing
+			// open here would let a malformed result false-complete a failure as
+			// success. Fail closed: derive isError:true so the turn-runner does not
+			// settle to `completed`/`completedViaEvents`.
+			const event = { type: "result", timestamp: "2025-01-01T00:00:00Z" };
+			const stream = makeStream([`${JSON.stringify(event)}\n`]);
+			const events = await collectEvents(stream);
+			expect(events[0]?.isError).toBe(true);
+			// Original fields preserved (immutability — new object, no mutation).
+			expect(events[0]?.type).toBe("result");
+			expect(events[0]?.timestamp).toBe("2025-01-01T00:00:00Z");
+		});
+
+		test("result event with a non-string outcome FAILS CLOSED (isError:true)", async () => {
+			// An `outcome` that isn't a recognizable "success" string is not a clean
+			// discriminator — fail closed rather than guessing.
+			const event = { type: "result", timestamp: "2025-01-01T00:00:00Z", outcome: 42 };
+			const stream = makeStream([`${JSON.stringify(event)}\n`]);
+			const events = await collectEvents(stream);
+			expect(events[0]?.isError).toBe(true);
+		});
+
+		test("non-result events with an outcome field are not normalized", async () => {
+			// Only the terminal `result` event carries the success/error
+			// discriminator; an unrelated event that happens to have `outcome`
+			// must pass through untouched.
+			const event = { type: "tool_end", timestamp: "2025-01-01T00:00:00Z", outcome: "whatever" };
+			const stream = makeStream([`${JSON.stringify(event)}\n`]);
+			const events = await collectEvents(stream);
+			expect(events[0]).toEqual(event);
+			expect(events[0]?.isError).toBeUndefined();
 		});
 	});
 

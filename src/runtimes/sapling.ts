@@ -81,6 +81,52 @@ const NON_IMPLEMENTATION_CAPABILITIES = new Set([
 const COORDINATION_CAPABILITIES = new Set(["coordinator", "orchestrator", "supervisor", "monitor"]);
 
 /**
+ * Normalize a sapling terminal `result` event so the runtime-agnostic
+ * turn-runner completion check (`cleanResult = event.isError !== true`) is
+ * correct for sapling's real event shape.
+ *
+ * LIVE sapling emits its final result as:
+ *   { type: "result", outcome: "success" | "max_turns" | "error", summary,
+ *     totalTurns, totalInputTokens, totalOutputTokens }
+ * (https://github.com/jayminwest/sapling/blob/main/src/hooks/events.ts).
+ *
+ * Critically, that event carries NO `isError` field — the success/failure
+ * discriminator is `outcome`. Without normalization, `event.isError !== true`
+ * is vacuously true for an `outcome:"error"` (or `"max_turns"`) result, so an
+ * ERRORED sapling task would set `cleanResult=true` → `completedViaEvents=true`
+ * → FALSE completion (a failure reported upstream as success).
+ *
+ * This derives `isError` from `outcome` for result events: a clean completion
+ * requires `outcome === "success"`; `"error"` and `"max_turns"` are failures.
+ * Rules (immutability preserved — returns a new object, never mutates the input):
+ * - An explicit `isError` already on the event WINS (any future sapling shape
+ *   that sets it pass through untouched — `isError:false` stays clean,
+ *   `isError:true` stays a failure).
+ * - `outcome === "success"` → clean (`isError:false`).
+ * - Any OTHER recognized outcome string (`"error"`, `"max_turns"`) → failure.
+ * - A `result` event with NEITHER a recognizable success discriminator
+ *   (`outcome === "success"` or explicit `isError === false`) FAILS CLOSED:
+ *   `isError:true`. This runs only inside `SaplingRuntime.parseEvents`, so every
+ *   `result` here is a sapling terminal result — a malformed one lacking any
+ *   success signal (no string `outcome`, no explicit `isError`) must NOT be
+ *   treated as a clean completion (that would false-complete a failure as
+ *   success). Failing closed makes the worst case a spurious failure signal, not
+ *   a silently-dropped failure.
+ * - Non-`result` events are never touched, even if they carry an `outcome`.
+ */
+function normalizeResultEvent(event: AgentEvent): AgentEvent {
+	if (event.type !== "result") return event;
+	// An explicit discriminator already present — respect it (true or false).
+	if ("isError" in event) return event;
+	// A recognizable clean success discriminator keeps the result clean.
+	if (event.outcome === "success") return { ...event, isError: false };
+	// Otherwise FAIL CLOSED: a sapling result with no success signal (a known
+	// failure outcome, an unrecognized/non-string outcome, or no outcome at all)
+	// is treated as a failure so a malformed result never false-completes.
+	return { ...event, isError: true };
+}
+
+/**
  * Build the full guards configuration object for .sapling/guards.json.
  *
  * Translates overstory guard-rules.ts constants and HooksDef fields into a
@@ -643,7 +689,7 @@ export class SaplingRuntime implements AgentRuntime {
 					if (!trimmed) continue;
 
 					try {
-						const event = JSON.parse(trimmed) as AgentEvent;
+						const event = normalizeResultEvent(JSON.parse(trimmed) as AgentEvent);
 						yield event;
 					} catch {
 						// Skip malformed lines — partial writes or debug output.
@@ -655,7 +701,7 @@ export class SaplingRuntime implements AgentRuntime {
 			const remaining = buffer.trim();
 			if (remaining) {
 				try {
-					const event = JSON.parse(remaining) as AgentEvent;
+					const event = normalizeResultEvent(JSON.parse(remaining) as AgentEvent);
 					yield event;
 				} catch {
 					// Skip malformed trailing line.
