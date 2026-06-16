@@ -35,7 +35,6 @@ import { createMailClient } from "../mail/client.ts";
 import { createMailStore } from "../mail/store.ts";
 import { createMulchClient } from "../mulch/client.ts";
 import { getRuntime } from "../runtimes/registry.ts";
-import { ensureSaplingProxyRunning, resolveSaplingProxy } from "../runtimes/sapling-proxy.ts";
 import { openSessionStore } from "../sessions/compat.ts";
 import { createRunStore } from "../sessions/store.ts";
 import type { TrackerIssue } from "../tracker/factory.ts";
@@ -1086,23 +1085,22 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 				// resolved from the same row.
 				const priorClaudeSessionId = existingSession?.claudeSessionId ?? null;
 
-				// Preflight: when this is a SAPLING worker AND subscription-proxy mode is
-				// enabled (config.runtime.sapling.subscriptionProxy or the env fallback),
-				// ensure the local bearer proxy is listening before spawning the worker.
-				// Idempotent — no-ops if already up, auto-starts it detached otherwise.
-				// A failed preflight hard-fails the dispatch rather than letting the worker
-				// spawn against a dead proxy (which would 401 mid-task).
-				if (runtime.id === "sapling") {
-					const proxy = resolveSaplingProxy(config.runtime?.sapling);
-					if (proxy.enabled) {
-						const result = await ensureSaplingProxyRunning(proxy.proxyUrl);
-						if (!result.ready) {
-							throw new AgentError(
-								`sapling subscription proxy is not reachable at ${proxy.proxyUrl} and could not be auto-started. ` +
-									"Start it manually:  bun scripts/anthropic-bearer-proxy.mjs",
-								{ agentName: name },
-							);
-						}
+				// Preflight the FIRST dispatch. The same per-spawn readiness check the
+				// turn-runner runs before every later turn (runtime.preflightDirectSpawn)
+				// is delegated here for the initial spawn, so both paths share one source
+				// of truth. For sapling-with-subscription-proxy this health-checks the local
+				// bearer proxy (auto-starting it when down) and throws when it is squatted,
+				// token-less, or unreachable — hard-failing the dispatch rather than letting
+				// the worker spawn against a dead/misconfigured proxy (which would 401
+				// mid-task). Idempotent + cheap: the turn-runner re-running it is a no-op
+				// localhost GET when already healthy. Runtimes without the method are no-ops.
+				if (runtime.preflightDirectSpawn) {
+					try {
+						await runtime.preflightDirectSpawn();
+					} catch (err) {
+						throw new AgentError(err instanceof Error ? err.message : String(err), {
+							agentName: name,
+						});
 					}
 				}
 

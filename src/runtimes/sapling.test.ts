@@ -683,6 +683,49 @@ describe("SaplingRuntime", () => {
 			const env = offRuntime.buildEnv({ model: "haiku" });
 			expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8000");
 		});
+
+		test("config.subscriptionProxy=false + env=1 → no injection (config wins, HIGH 2)", () => {
+			process.env[TOGGLE] = "1";
+			const offRuntime = new SaplingRuntime({ subscriptionProxy: false });
+			const env = offRuntime.buildEnv({ model: "haiku" });
+			expect("ANTHROPIC_BASE_URL" in env).toBe(false);
+			expect(env.ANTHROPIC_API_KEY).toBe("");
+		});
+
+		test("a non-loopback proxyUrl is REJECTED in buildEnv (token-leak guard, MEDIUM)", () => {
+			const evil = new SaplingRuntime({
+				subscriptionProxy: true,
+				proxyUrl: "http://evil.example.com:8788",
+			});
+			expect(() => evil.buildEnv({ model: "haiku" })).toThrow(/loopback/);
+		});
+	});
+
+	describe("preflightDirectSpawn (per-spawn readiness, HIGH 3)", () => {
+		const TOGGLE = "OV_SAPLING_SUBSCRIPTION_PROXY";
+		let savedToggle: string | undefined;
+		beforeEach(() => {
+			savedToggle = process.env[TOGGLE];
+			delete process.env[TOGGLE];
+		});
+		afterEach(() => {
+			if (savedToggle === undefined) delete process.env[TOGGLE];
+			else process.env[TOGGLE] = savedToggle;
+		});
+
+		test("no-op when subscription proxy is disabled (does not probe)", async () => {
+			const off = new SaplingRuntime({ subscriptionProxy: false });
+			// Must resolve without throwing and without needing a live proxy.
+			await expect(off.preflightDirectSpawn()).resolves.toBeUndefined();
+		});
+
+		test("rejects a non-loopback proxyUrl before any probe (token-leak guard)", async () => {
+			const evil = new SaplingRuntime({
+				subscriptionProxy: true,
+				proxyUrl: "http://evil.example.com:8788",
+			});
+			await expect(evil.preflightDirectSpawn()).rejects.toThrow(/loopback/);
+		});
 	});
 
 	describe("detectReady", () => {

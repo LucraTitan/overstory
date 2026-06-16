@@ -335,6 +335,49 @@ describe("runTurn", () => {
 		expect(after?.state).toBe("working");
 	});
 
+	// HIGH 3 — per-turn (spawn-per-turn) readiness preflight. The turn-runner must invoke
+	// runtime.preflightDirectSpawn() before EVERY spawn (so a sapling proxy that died
+	// between turns is caught), and a thrown preflight must abort the spawn.
+	test("preflightDirectSpawn runs before the spawn on each turn", async () => {
+		seedSession(ctx.sessionsDbPath, { agentName: "pf-ok", state: "booting" });
+		const { runtime } = makeSpyRuntime();
+		const order: string[] = [];
+		(runtime as { preflightDirectSpawn?: () => Promise<void> }).preflightDirectSpawn = async () => {
+			order.push("preflight");
+		};
+
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			order.push("spawn");
+			emitFakeTurn(fake, { sessionId: "claude-sess-pf", isError: false });
+			fake._exit(0);
+			return fake;
+		};
+
+		await runTurn(makeRunOpts(ctx, "pf-ok", { runtime, _spawnFn: spawnFn }));
+
+		expect(order).toEqual(["preflight", "spawn"]);
+	});
+
+	test("a thrown preflightDirectSpawn aborts the dispatch (no spawn)", async () => {
+		seedSession(ctx.sessionsDbPath, { agentName: "pf-fail", state: "booting" });
+		const { runtime } = makeSpyRuntime();
+		(runtime as { preflightDirectSpawn?: () => Promise<void> }).preflightDirectSpawn = async () => {
+			throw new Error("proxy not ready");
+		};
+
+		let spawnCount = 0;
+		const spawnFn: TurnSpawnFn = () => {
+			spawnCount++;
+			return makeFakeProc();
+		};
+
+		await expect(
+			runTurn(makeRunOpts(ctx, "pf-fail", { runtime, _spawnFn: spawnFn })),
+		).rejects.toThrow(/proxy not ready/);
+		expect(spawnCount).toBe(0);
+	});
+
 	test("happy path: spawn, drain events, capture session id, contract violation surfaces as completed", async () => {
 		seedSession(ctx.sessionsDbPath, { agentName: "alpha", state: "booting" });
 		const { runtime, spawnCalls } = makeSpyRuntime();

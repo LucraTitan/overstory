@@ -19,7 +19,12 @@ import {
 } from "../agents/guard-rules.ts";
 import { DEFAULT_QUALITY_GATES } from "../config.ts";
 import type { ResolvedModel, SaplingRuntimeConfig } from "../types.ts";
-import { resolveSaplingProxy, SAPLING_PROXY_DUMMY_KEY } from "./sapling-proxy.ts";
+import {
+	assertLoopbackProxyUrl,
+	ensureSaplingProxyRunning,
+	resolveSaplingProxy,
+	SAPLING_PROXY_DUMMY_KEY,
+} from "./sapling-proxy.ts";
 import type {
 	AgentEvent,
 	AgentRuntime,
@@ -430,6 +435,36 @@ export class SaplingRuntime implements AgentRuntime {
 	}
 
 	/**
+	 * Per-spawn readiness preflight (HIGH 3). Sapling is spawn-per-turn — there is no
+	 * long-lived worker process — so this runs before EVERY sapling spawn (the initial
+	 * `ov sling` dispatch AND each later turn driven by the turn-runner), not just the
+	 * first. A proxy that died between turns would otherwise yield a silent 401 mid-task.
+	 *
+	 * No-op when subscription-proxy mode is disabled. When enabled it:
+	 *   1. validates the proxy URL is loopback (token-leak guard), then
+	 *   2. health-gates readiness via {@link ensureSaplingProxyRunning} — a single cheap
+	 *      localhost GET to /__ov_proxy_health when already healthy, an auto-start when
+	 *      down, and a hard error (thrown AgentError-equivalent) when the port is squatted
+	 *      by another service or no subscription token is available.
+	 *
+	 * Idempotent and cheap: callers may invoke it redundantly (e.g. sling.ts already ran
+	 * it for the same dispatch) — the health probe makes the already-healthy case a
+	 * no-op, so there is no need to conditionally skip it.
+	 */
+	async preflightDirectSpawn(): Promise<void> {
+		const proxy = resolveSaplingProxy(this.config);
+		if (!proxy.enabled) return;
+		assertLoopbackProxyUrl(proxy.proxyUrl);
+		const result = await ensureSaplingProxyRunning(proxy.proxyUrl);
+		if (!result.ready) {
+			throw new Error(
+				`sapling subscription proxy is not ready at ${proxy.proxyUrl} (see the guidance logged above). ` +
+					"Refusing to spawn a sapling worker against a dead/misconfigured proxy.",
+			);
+		}
+	}
+
+	/**
 	 * Build the shell command string to spawn a Sapling agent in a tmux pane.
 	 *
 	 * This method exists for the TUI fallback path (e.g., `ov sling --runtime sapling`
@@ -805,6 +840,10 @@ export class SaplingRuntime implements AgentRuntime {
 		// returned env is byte-identical to the pre-feature behavior.
 		const proxy = resolveSaplingProxy(this.config);
 		if (proxy.enabled) {
+			// Loopback-only: the proxy injects the operator's subscription token into
+			// every forwarded request, so a non-loopback host would leak that token to a
+			// remote. Reject before we ever wire ANTHROPIC_BASE_URL at it.
+			assertLoopbackProxyUrl(proxy.proxyUrl);
 			env.ANTHROPIC_BASE_URL = proxy.proxyUrl;
 			// The proxy ignores x-api-key, but the SDK still requires a non-empty key.
 			env.ANTHROPIC_API_KEY = SAPLING_PROXY_DUMMY_KEY;
