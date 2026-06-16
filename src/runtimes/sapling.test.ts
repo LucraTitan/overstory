@@ -603,6 +603,88 @@ describe("SaplingRuntime", () => {
 		});
 	});
 
+	describe("buildEnv subscription-proxy routing (sapling-scoped)", () => {
+		// Capture/restore the env-fallback toggle so an ambient value can't make
+		// the "off by default" assertions flaky.
+		const TOGGLE = "OV_SAPLING_SUBSCRIPTION_PROXY";
+		const PROXY_URL_ENV = "OV_SAPLING_PROXY_URL";
+		let savedToggle: string | undefined;
+		let savedUrl: string | undefined;
+		beforeEach(() => {
+			savedToggle = process.env[TOGGLE];
+			savedUrl = process.env[PROXY_URL_ENV];
+			delete process.env[TOGGLE];
+			delete process.env[PROXY_URL_ENV];
+		});
+		afterEach(() => {
+			if (savedToggle === undefined) delete process.env[TOGGLE];
+			else process.env[TOGGLE] = savedToggle;
+			if (savedUrl === undefined) delete process.env[PROXY_URL_ENV];
+			else process.env[PROXY_URL_ENV] = savedUrl;
+		});
+
+		test("OFF by default: no proxy config + no env → no ANTHROPIC_BASE_URL injected", () => {
+			const offRuntime = new SaplingRuntime(); // no config
+			const model: ResolvedModel = { model: "haiku" };
+			const env = offRuntime.buildEnv(model);
+			// Byte-identical to the no-proxy baseline: API_KEY cleared, no base url.
+			expect(env.ANTHROPIC_API_KEY).toBe("");
+			expect("ANTHROPIC_BASE_URL" in env).toBe(false);
+			expect("SAPLING_BACKEND" in env).toBe(false);
+		});
+
+		test("config.subscriptionProxy=false → no proxy injection", () => {
+			const offRuntime = new SaplingRuntime({ subscriptionProxy: false });
+			const env = offRuntime.buildEnv({ model: "haiku" });
+			expect("ANTHROPIC_BASE_URL" in env).toBe(false);
+			expect(env.ANTHROPIC_API_KEY).toBe("");
+		});
+
+		test("config.subscriptionProxy=true → injects default proxy base url + dummy key + sdk backend", () => {
+			const onRuntime = new SaplingRuntime({ subscriptionProxy: true });
+			const env = onRuntime.buildEnv({ model: "haiku" });
+			expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8788");
+			expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-proxy-dummy");
+			expect(env.SAPLING_BACKEND).toBe("sdk");
+		});
+
+		test("config.proxyUrl overrides the injected base url", () => {
+			const onRuntime = new SaplingRuntime({
+				subscriptionProxy: true,
+				proxyUrl: "http://127.0.0.1:9100",
+			});
+			const env = onRuntime.buildEnv({ model: "sonnet" });
+			expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:9100");
+		});
+
+		test("proxy base url overrides any gateway-provided ANTHROPIC_BASE_URL", () => {
+			const onRuntime = new SaplingRuntime({ subscriptionProxy: true });
+			const env = onRuntime.buildEnv({
+				model: "sonnet",
+				env: { ANTHROPIC_BASE_URL: "https://gateway.example.com/v1" },
+			});
+			// Proxy wins — sapling must hit the local bearer proxy, not the gateway.
+			expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8788");
+			expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-proxy-dummy");
+		});
+
+		test("env fallback OV_SAPLING_SUBSCRIPTION_PROXY=1 enables injection when config absent", () => {
+			process.env[TOGGLE] = "1";
+			const offRuntime = new SaplingRuntime(); // no config — env drives it
+			const env = offRuntime.buildEnv({ model: "haiku" });
+			expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8788");
+			expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-proxy-dummy");
+		});
+
+		test("env OV_SAPLING_PROXY_URL is honored with the env toggle", () => {
+			process.env[TOGGLE] = "1";
+			process.env[PROXY_URL_ENV] = "http://127.0.0.1:8000";
+			const offRuntime = new SaplingRuntime();
+			const env = offRuntime.buildEnv({ model: "haiku" });
+			expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8000");
+		});
+	});
+
 	describe("detectReady", () => {
 		test("returns { phase: 'ready' } for empty pane content", () => {
 			expect(runtime.detectReady("")).toEqual({ phase: "ready" });

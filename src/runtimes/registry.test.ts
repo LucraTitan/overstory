@@ -88,6 +88,36 @@ describe("getRuntime", () => {
 		expect(runtime.expandModel("sonnet")).toBe("anthropic/claude-sonnet-4-6");
 	});
 
+	it("passes runtime.sapling config to SaplingRuntime (subscription proxy enabled)", () => {
+		const config = {
+			runtime: {
+				default: "sapling",
+				sapling: { subscriptionProxy: true, proxyUrl: "http://127.0.0.1:8788" },
+			},
+		} as unknown as OverstoryConfig;
+		const runtime = getRuntime("sapling", config);
+		expect(runtime.id).toBe("sapling");
+		// Verify the config threaded through: buildEnv must inject the proxy base url.
+		const env = runtime.buildEnv({ model: "haiku" });
+		expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8788");
+		expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-proxy-dummy");
+	});
+
+	it("SaplingRuntime without sapling config does not inject a proxy base url", () => {
+		const saved = process.env.OV_SAPLING_SUBSCRIPTION_PROXY;
+		delete process.env.OV_SAPLING_SUBSCRIPTION_PROXY;
+		try {
+			const config = { runtime: { default: "sapling" } } as OverstoryConfig;
+			const runtime = getRuntime(undefined, config);
+			expect(runtime.id).toBe("sapling");
+			const env = runtime.buildEnv({ model: "haiku" });
+			expect("ANTHROPIC_BASE_URL" in env).toBe(false);
+		} finally {
+			if (saved === undefined) delete process.env.OV_SAPLING_SUBSCRIPTION_PROXY;
+			else process.env.OV_SAPLING_SUBSCRIPTION_PROXY = saved;
+		}
+	});
+
 	it("returns CopilotRuntime when name is 'copilot'", () => {
 		const runtime = getRuntime("copilot");
 		expect(runtime).toBeInstanceOf(CopilotRuntime);

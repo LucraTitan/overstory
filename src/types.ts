@@ -32,6 +32,32 @@ export interface PiRuntimeConfig {
 	modelMap: Record<string, string>;
 }
 
+/**
+ * Configuration for routing Sapling workers through a local subscription-auth proxy.
+ *
+ * Sapling's Anthropic SDK backend sends its credential as `x-api-key`, which a Claude
+ * Code SUBSCRIPTION OAuth token (`sk-ant-oat01-…`) cannot satisfy (it only authenticates
+ * as `Authorization: Bearer …`). When `subscriptionProxy` is enabled, overstory points
+ * sapling workers at a local bearer-injecting proxy (scripts/anthropic-bearer-proxy.mjs)
+ * so they run on the operator's subscription instead of requiring an API key.
+ *
+ * This is SAPLING-SCOPED: Claude Code workers are never routed through the proxy.
+ * Undefined/false → byte-identical to the no-proxy behavior.
+ */
+export interface SaplingRuntimeConfig {
+	/**
+	 * Route sapling workers through the local subscription bearer proxy.
+	 * Default: false (sapling uses whatever provider env the model resolves to).
+	 */
+	subscriptionProxy?: boolean;
+	/**
+	 * Base URL of the local bearer proxy. Default: "http://127.0.0.1:8788".
+	 * Injected as ANTHROPIC_BASE_URL into the sapling worker env when
+	 * `subscriptionProxy` is enabled.
+	 */
+	proxyUrl?: string;
+}
+
 // === Task Tracker ===
 
 /** Backend for the task tracker. Defined here for use in OverstoryConfig. */
@@ -135,6 +161,13 @@ export interface OverstoryConfig {
 		printCommand?: string;
 		/** Pi runtime configuration for model alias expansion. */
 		pi?: PiRuntimeConfig;
+		/**
+		 * Sapling runtime configuration. When `subscriptionProxy` is enabled, sapling
+		 * workers are routed through a local bearer-injecting proxy so they run on a
+		 * Claude Code subscription instead of requiring an `sk-ant-api…` API key.
+		 * Sapling-scoped — Claude Code workers are unaffected. Omit → no proxy.
+		 */
+		sapling?: SaplingRuntimeConfig;
 		/**
 		 * Delay in milliseconds between creating a tmux session and polling
 		 * for TUI readiness. Gives slow shells (oh-my-zsh, starship, etc.)

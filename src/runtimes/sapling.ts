@@ -18,7 +18,8 @@ import {
 	WRITE_TOOLS,
 } from "../agents/guard-rules.ts";
 import { DEFAULT_QUALITY_GATES } from "../config.ts";
-import type { ResolvedModel } from "../types.ts";
+import type { ResolvedModel, SaplingRuntimeConfig } from "../types.ts";
+import { resolveSaplingProxy, SAPLING_PROXY_DUMMY_KEY } from "./sapling-proxy.ts";
 import type {
 	AgentEvent,
 	AgentRuntime,
@@ -414,6 +415,21 @@ export class SaplingRuntime implements AgentRuntime {
 	readonly signalsCompletionViaEvents = true;
 
 	/**
+	 * Optional sapling-scoped runtime config (e.g. subscription-proxy routing).
+	 * Sourced from `config.runtime.sapling` at construction via the registry,
+	 * mirroring how PiRuntime receives `config.runtime.pi`. Undefined → no proxy.
+	 */
+	private readonly config?: SaplingRuntimeConfig;
+
+	/**
+	 * @param config - Optional `runtime.sapling` config. When omitted, sapling
+	 *   behaves exactly as before (no subscription-proxy routing).
+	 */
+	constructor(config?: SaplingRuntimeConfig) {
+		this.config = config;
+	}
+
+	/**
 	 * Build the shell command string to spawn a Sapling agent in a tmux pane.
 	 *
 	 * This method exists for the TUI fallback path (e.g., `ov sling --runtime sapling`
@@ -774,6 +790,25 @@ export class SaplingRuntime implements AgentRuntime {
 			if (key.startsWith("ANTHROPIC_DEFAULT_") && key.endsWith("_MODEL")) {
 				env[key] = value;
 			}
+		}
+
+		// Subscription-proxy routing (SAPLING-SCOPED). When enabled via
+		// config.runtime.sapling.subscriptionProxy (or the OV_SAPLING_SUBSCRIPTION_PROXY
+		// env fallback), point the sapling worker's Anthropic SDK at the local
+		// bearer-injecting proxy. The proxy swaps the dummy x-api-key for the operator's
+		// Claude Code subscription token, so sapling runs with no `sk-ant-api…` key.
+		//
+		// This MUST stay inside SaplingRuntime.buildEnv: it is the only point scoped to
+		// sapling workers. ClaudeRuntime.buildEnv never sets ANTHROPIC_BASE_URL, so claude
+		// workers are unaffected (their auth path is untouched). When the toggle is unset,
+		// resolveSaplingProxy returns { enabled: false } and this block is a no-op — the
+		// returned env is byte-identical to the pre-feature behavior.
+		const proxy = resolveSaplingProxy(this.config);
+		if (proxy.enabled) {
+			env.ANTHROPIC_BASE_URL = proxy.proxyUrl;
+			// The proxy ignores x-api-key, but the SDK still requires a non-empty key.
+			env.ANTHROPIC_API_KEY = SAPLING_PROXY_DUMMY_KEY;
+			env.SAPLING_BACKEND = "sdk";
 		}
 
 		return env;

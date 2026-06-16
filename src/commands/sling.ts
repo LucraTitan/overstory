@@ -35,6 +35,7 @@ import { createMailClient } from "../mail/client.ts";
 import { createMailStore } from "../mail/store.ts";
 import { createMulchClient } from "../mulch/client.ts";
 import { getRuntime } from "../runtimes/registry.ts";
+import { ensureSaplingProxyRunning, resolveSaplingProxy } from "../runtimes/sapling-proxy.ts";
 import { openSessionStore } from "../sessions/compat.ts";
 import { createRunStore } from "../sessions/store.ts";
 import type { TrackerIssue } from "../tracker/factory.ts";
@@ -1084,6 +1085,26 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 				// Re-using it here keeps re-spawn linkage (parentAgent + claudeSessionId)
 				// resolved from the same row.
 				const priorClaudeSessionId = existingSession?.claudeSessionId ?? null;
+
+				// Preflight: when this is a SAPLING worker AND subscription-proxy mode is
+				// enabled (config.runtime.sapling.subscriptionProxy or the env fallback),
+				// ensure the local bearer proxy is listening before spawning the worker.
+				// Idempotent — no-ops if already up, auto-starts it detached otherwise.
+				// A failed preflight hard-fails the dispatch rather than letting the worker
+				// spawn against a dead proxy (which would 401 mid-task).
+				if (runtime.id === "sapling") {
+					const proxy = resolveSaplingProxy(config.runtime?.sapling);
+					if (proxy.enabled) {
+						const result = await ensureSaplingProxyRunning(proxy.proxyUrl);
+						if (!result.ready) {
+							throw new AgentError(
+								`sapling subscription proxy is not reachable at ${proxy.proxyUrl} and could not be auto-started. ` +
+									"Start it manually:  bun scripts/anthropic-bearer-proxy.mjs",
+								{ agentName: name },
+							);
+						}
+					}
+				}
 
 				// Build the initial prompt (mulch expertise + pending mail + beacon)
 				// as the first user turn.

@@ -66,6 +66,7 @@ export function getAllRuntimes(): AgentRuntime[] {
  *
  * Special cases:
  * - Pi runtime receives `config.runtime.pi` for model alias expansion.
+ * - Sapling runtime receives `config.runtime.sapling` for subscription-proxy routing.
  *
  * @param name - Runtime name to resolve (e.g. "claude"). Omit to use config default.
  * @param config - Overstory config for reading the default runtime.
@@ -87,6 +88,11 @@ export function getRuntime(
 	// Pi runtime needs config for model alias expansion.
 	if (runtimeName === "pi") {
 		return new PiRuntime(config?.runtime?.pi);
+	}
+
+	// Sapling runtime needs config for subscription-proxy routing.
+	if (runtimeName === "sapling") {
+		return new SaplingRuntime(config?.runtime?.sapling);
 	}
 
 	const factory = runtimes.get(runtimeName);
