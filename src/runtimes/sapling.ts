@@ -14,10 +14,7 @@ import {
 	DANGEROUS_BASH_PATTERNS,
 	INTERACTIVE_TOOLS,
 	NATIVE_TEAM_TOOLS,
-	SAFE_BASH_PREFIXES,
-	WRITE_TOOLS,
 } from "../agents/guard-rules.ts";
-import { DEFAULT_QUALITY_GATES } from "../config.ts";
 import type { ResolvedModel, SaplingRuntimeConfig } from "../types.ts";
 import {
 	assertLoopbackProxyUrl,
@@ -83,9 +80,6 @@ const NON_IMPLEMENTATION_CAPABILITIES = new Set([
 	"monitor",
 ]);
 
-/** Coordination capabilities that get git add/commit whitelisted for metadata sync. */
-const COORDINATION_CAPABILITIES = new Set(["coordinator", "orchestrator", "supervisor", "monitor"]);
-
 /**
  * Normalize a sapling terminal `result` event so the runtime-agnostic
  * turn-runner completion check (`cleanResult = event.isError !== true`) is
@@ -133,76 +127,88 @@ function normalizeResultEvent(event: AgentEvent): AgentEvent {
 }
 
 /**
- * Build the full guards configuration object for .sapling/guards.json.
+ * sp 0.3.2 `GuardConfig` (the EXACT shape `sp run --guards-file` parses).
  *
- * Translates overstory guard-rules.ts constants and HooksDef fields into a
- * JSON-serializable format that the `sp` CLI can consume to enforce:
- * - Path boundary: all writes must target files within worktreePath.
- * - Blocked tools: NATIVE_TEAM_TOOLS and INTERACTIVE_TOOLS for all agents;
- *   WRITE_TOOLS additionally for non-implementation capabilities.
- * - Bash guards: DANGEROUS_BASH_PATTERNS blocklist (non-impl) or
- *   FILE_MODIFYING_BASH_PATTERNS path boundary (impl), with SAFE_BASH_PREFIXES.
- * - Quality gates: commands agents must pass before reporting completion.
- * - Event config: argv arrays for activity tracking via `ov log`.
+ * Mirrors `@os-eco/sapling-cli` `src/types.ts` `GuardConfig` (lines 304-314).
+ * `rules` is REQUIRED — sp throws `Guards file must have a "rules" array` when
+ * it is absent, which is the bug that made every sapling worker hard-error once
+ * the 2026-06-13 `--guards-file` change made sp actually LOAD this file. The flat
+ * fields (`pathBoundary`/`readOnly`/`blockedTools`/`blockedBashPatterns`) do the
+ * enforcement and are evaluated before `rules`, so an empty `rules: []` is valid.
  *
- * @param hooks - Agent identity, capability, worktree path, and optional quality gates.
- * @returns JSON-serializable guards configuration object.
+ * Only fields sp defines are emitted — ov-internal concepts (agentName, capability,
+ * writeToolsBlocked, writeToolNames, qualityGates, safePrefixes, nested bashGuards)
+ * are intentionally NOT written, so the file is unambiguous to sp.
  */
-function buildGuardsConfig(hooks: HooksDef): Record<string, unknown> {
-	const { agentName, capability, worktreePath, qualityGates } = hooks;
-	const gates = qualityGates ?? DEFAULT_QUALITY_GATES;
-	const isNonImpl = NON_IMPLEMENTATION_CAPABILITIES.has(capability);
-	const isCoordination = COORDINATION_CAPABILITIES.has(capability);
+interface SaplingGuardConfig {
+	version?: string;
+	rules: never[];
+	pathBoundary?: string;
+	readOnly?: boolean;
+	blockedBashPatterns?: string[];
+	blockedTools?: string[];
+	eventConfig?: {
+		onToolStart?: string[];
+		onToolEnd?: string[];
+		onSessionEnd?: string[];
+	};
+}
 
-	// Build safe Bash prefixes: base set + coordination extras + quality gate commands.
-	const safePrefixes: string[] = [
-		...SAFE_BASH_PREFIXES,
-		...(isCoordination ? ["git add", "git commit"] : []),
-		...gates.map((g) => g.command),
+/**
+ * Build the guards configuration object for .sapling/guards.json.
+ *
+ * Emits EXACTLY sp 0.3.2's `GuardConfig` shape (see {@link SaplingGuardConfig})
+ * so `sp run --guards-file` parses it. ov's enforcement intent is preserved via
+ * sp's flat fields:
+ * - `pathBoundary`: all file ops must target paths within worktreePath.
+ * - `readOnly`: true for non-implementation capabilities (blocks write/edit tools).
+ * - `blockedTools`: NATIVE_TEAM_TOOLS + INTERACTIVE_TOOLS for all agents.
+ * - `blockedBashPatterns`: a single FLAT regex list — DANGEROUS_BASH_PATTERNS always,
+ *   plus FILE_MODIFYING_BASH_PATTERNS for read-only/non-impl agents (which must not
+ *   modify files at all). sp evaluates these against every bash command.
+ * - `eventConfig`: argv arrays for activity tracking via `ov log` (sp fires these
+ *   natively on tool-start/tool-end/session-end).
+ *
+ * Note: sp has no `safePrefixes` allowlist, so ov's safe-prefix bypass is dropped.
+ * To avoid blocking coordination agents' own git/quality-gate commands, the
+ * file-modifying git patterns are only added for read-only agents (impl agents
+ * legitimately run them).
+ *
+ * @param hooks - Agent identity, capability, and worktree path.
+ * @returns sp-compatible guards configuration object.
+ */
+function buildGuardsConfig(hooks: HooksDef): SaplingGuardConfig {
+	const { agentName, capability, worktreePath } = hooks;
+	const isNonImpl = NON_IMPLEMENTATION_CAPABILITIES.has(capability);
+
+	// Flat blocked-bash list. DANGEROUS patterns always apply; FILE_MODIFYING
+	// patterns are added for read-only (non-impl) agents — they must not modify
+	// files via bash. Implementation agents (builder/merger) need file-modifying
+	// bash (sed/mv/cp/mkdir/etc.) to do their job, so those are NOT blocked for
+	// them — the pathBoundary still confines writes to the worktree.
+	const blockedBashPatterns: string[] = [
+		...DANGEROUS_BASH_PATTERNS,
+		...(isNonImpl ? FILE_MODIFYING_BASH_PATTERNS : []),
 	];
 
 	return {
-		// Schema version for forward-compatibility.
-		version: 1,
-		// Agent identity (injected into event tracking commands).
-		agentName,
-		capability,
+		// sp's version is `version?: string` — use a string, not a number.
+		version: "1",
+		// REQUIRED by sp. The flat fields below do the enforcement; empty is valid.
+		rules: [],
 		// Path boundary: all file writes must target paths within this directory.
-		// Equivalent to the worktree's exclusive file scope.
 		pathBoundary: worktreePath,
-		// Read-only mode: true for non-implementation capabilities (scout, reviewer, lead, etc.).
-		// When true, write tools are blocked in addition to the always-blocked tool set.
+		// Read-only mode: true for non-implementation capabilities (scout, reviewer,
+		// lead, etc.). sp blocks all write/edit tools when true.
 		readOnly: isNonImpl,
 		// Tool names blocked for ALL agents.
-		// - nativeTeamTools: use `ov sling` for delegation instead.
-		// - interactiveTools: escalate via `ov mail --type question` instead.
+		// - NATIVE_TEAM_TOOLS: use `ov sling` for delegation instead.
+		// - INTERACTIVE_TOOLS: escalate via `ov mail --type question` instead.
 		blockedTools: [...NATIVE_TEAM_TOOLS, ...INTERACTIVE_TOOLS],
-		// Tool names blocked only for read-only (non-implementation) agents.
-		// Empty array for implementation agents (builder/merger).
-		writeToolsBlocked: isNonImpl ? [...WRITE_TOOLS] : [],
-		// Write/edit tool names subject to path boundary enforcement (all agents).
-		writeToolNames: [...WRITE_TOOLS],
-		bashGuards: {
-			// Safe Bash prefixes: bypass dangerous pattern checks when matched.
-			// Includes base overstory commands, optional git add/commit for coordination,
-			// and quality gate command prefixes.
-			safePrefixes,
-			// Dangerous Bash patterns: blocked for non-implementation agents.
-			// Each string is a regex fragment (grep -qE compatible).
-			dangerousPatterns: DANGEROUS_BASH_PATTERNS,
-			// File-modifying Bash patterns: require path boundary check for implementation agents.
-			// Each string is a regex fragment; matched paths must fall within pathBoundary.
-			fileModifyingPatterns: FILE_MODIFYING_BASH_PATTERNS,
-		},
-		// Quality gate commands that must pass before the agent reports task completion.
-		qualityGates: gates.map((g) => ({
-			name: g.name,
-			command: g.command,
-			description: g.description,
-		})),
-		// Activity tracking event configuration.
-		// Each value is an argv array passed to Bun.spawn() — no shell interpolation.
-		// The `sp` runtime fires these on the corresponding lifecycle events.
+		// Flat regex blocklist evaluated by sp against every bash command.
+		blockedBashPatterns,
+		// Activity tracking event configuration (sp fires these natively).
+		// Each value is an argv array passed to a subprocess — no shell interpolation.
 		eventConfig: {
 			// Fires before each tool executes (updates lastActivity in SessionStore).
 			onToolStart: ["ov", "log", "tool-start", "--agent", agentName],

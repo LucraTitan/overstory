@@ -29,6 +29,7 @@
 		"src",
 		"agents",
 		"templates",
+		"scripts",
 		"ui/dist"
 	],
 	"publishConfig": {
