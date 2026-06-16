@@ -2966,4 +2966,61 @@ describe("startCoordinatorSession headless", () => {
 			),
 		).rejects.toThrow(ValidationError);
 	});
+
+	test("runs runtime.preflightDirectSpawn before buildDirectSpawn (sapling proxy gate)", async () => {
+		// Route the coordinator capability to sapling with the subscription proxy
+		// enabled and pointed at a NON-loopback URL. SaplingRuntime.preflightDirectSpawn
+		// rejects a non-loopback proxy (token-leak guard) BEFORE buildDirectSpawn —
+		// so if the coordinator headless path runs the preflight, the dispatch hard-fails
+		// and the spawn never happens. This proves the gate fires in the coordinator path
+		// (HIGH 2 — previously bypassed: coordinator called buildDirectSpawn directly).
+		await Bun.write(
+			join(overstoryDir, "config.yaml"),
+			[
+				"project:",
+				"  name: test-project",
+				`  root: ${tempDir}`,
+				"  canonicalBranch: main",
+				"watchdog:",
+				"  tier2Enabled: true",
+				"runtime:",
+				"  capabilities:",
+				"    coordinator: sapling",
+				"  sapling:",
+				"    subscriptionProxy: true",
+				"    proxyUrl: http://evil.example.com:8788",
+			].join("\n"),
+		);
+
+		const { tmux } = makeFakeTmux();
+		const { watchdog } = makeFakeWatchdog();
+		const { monitor } = makeFakeMonitor();
+		let spawnCalled = false;
+		const deps: CoordinatorDeps = {
+			_tmux: tmux,
+			_watchdog: watchdog,
+			_monitor: monitor,
+			_spawnHeadless: async () => {
+				spawnCalled = true;
+				throw new Error("spawn must not be reached when preflight rejects");
+			},
+		};
+
+		await expect(
+			startCoordinatorSession(
+				{
+					json: true,
+					attach: false,
+					watchdog: false,
+					monitor: false,
+					headless: true,
+				},
+				deps,
+			),
+		).rejects.toThrow(/loopback/);
+
+		// The preflight rejected before the spawn — buildDirectSpawn/_spawnHeadless
+		// were never reached.
+		expect(spawnCalled).toBe(false);
+	});
 });

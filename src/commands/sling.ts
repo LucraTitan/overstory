@@ -1085,6 +1085,25 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 				// resolved from the same row.
 				const priorClaudeSessionId = existingSession?.claudeSessionId ?? null;
 
+				// Preflight the FIRST dispatch. The same per-spawn readiness check the
+				// turn-runner runs before every later turn (runtime.preflightDirectSpawn)
+				// is delegated here for the initial spawn, so both paths share one source
+				// of truth. For sapling-with-subscription-proxy this health-checks the local
+				// bearer proxy (auto-starting it when down) and throws when it is squatted,
+				// token-less, or unreachable — hard-failing the dispatch rather than letting
+				// the worker spawn against a dead/misconfigured proxy (which would 401
+				// mid-task). Idempotent + cheap: the turn-runner re-running it is a no-op
+				// localhost GET when already healthy. Runtimes without the method are no-ops.
+				if (runtime.preflightDirectSpawn) {
+					try {
+						await runtime.preflightDirectSpawn();
+					} catch (err) {
+						throw new AgentError(err instanceof Error ? err.message : String(err), {
+							agentName: name,
+						});
+					}
+				}
+
 				// Build the initial prompt (mulch expertise + pending mail + beacon)
 				// as the first user turn.
 				const pendingMailStore = createMailStore(join(overstoryDir, "mail.db"));

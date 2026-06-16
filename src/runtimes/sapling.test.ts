@@ -6,9 +6,7 @@ import {
 	DANGEROUS_BASH_PATTERNS,
 	INTERACTIVE_TOOLS,
 	NATIVE_TEAM_TOOLS,
-	SAFE_BASH_PREFIXES,
 } from "../agents/guard-rules.ts";
-import { DEFAULT_QUALITY_GATES } from "../config.ts";
 import type { ResolvedModel } from "../types.ts";
 import { SaplingRuntime } from "./sapling.ts";
 import type { DirectSpawnOpts, HooksDef, RpcProcessHandle, SpawnOpts } from "./types.ts";
@@ -603,6 +601,131 @@ describe("SaplingRuntime", () => {
 		});
 	});
 
+	describe("buildEnv subscription-proxy routing (sapling-scoped)", () => {
+		// Capture/restore the env-fallback toggle so an ambient value can't make
+		// the "off by default" assertions flaky.
+		const TOGGLE = "OV_SAPLING_SUBSCRIPTION_PROXY";
+		const PROXY_URL_ENV = "OV_SAPLING_PROXY_URL";
+		let savedToggle: string | undefined;
+		let savedUrl: string | undefined;
+		beforeEach(() => {
+			savedToggle = process.env[TOGGLE];
+			savedUrl = process.env[PROXY_URL_ENV];
+			delete process.env[TOGGLE];
+			delete process.env[PROXY_URL_ENV];
+		});
+		afterEach(() => {
+			if (savedToggle === undefined) delete process.env[TOGGLE];
+			else process.env[TOGGLE] = savedToggle;
+			if (savedUrl === undefined) delete process.env[PROXY_URL_ENV];
+			else process.env[PROXY_URL_ENV] = savedUrl;
+		});
+
+		test("OFF by default: no proxy config + no env → no ANTHROPIC_BASE_URL injected", () => {
+			const offRuntime = new SaplingRuntime(); // no config
+			const model: ResolvedModel = { model: "haiku" };
+			const env = offRuntime.buildEnv(model);
+			// Byte-identical to the no-proxy baseline: API_KEY cleared, no base url.
+			expect(env.ANTHROPIC_API_KEY).toBe("");
+			expect("ANTHROPIC_BASE_URL" in env).toBe(false);
+			expect("SAPLING_BACKEND" in env).toBe(false);
+		});
+
+		test("config.subscriptionProxy=false → no proxy injection", () => {
+			const offRuntime = new SaplingRuntime({ subscriptionProxy: false });
+			const env = offRuntime.buildEnv({ model: "haiku" });
+			expect("ANTHROPIC_BASE_URL" in env).toBe(false);
+			expect(env.ANTHROPIC_API_KEY).toBe("");
+		});
+
+		test("config.subscriptionProxy=true → injects default proxy base url + dummy key + sdk backend", () => {
+			const onRuntime = new SaplingRuntime({ subscriptionProxy: true });
+			const env = onRuntime.buildEnv({ model: "haiku" });
+			expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8788");
+			expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-proxy-dummy");
+			expect(env.SAPLING_BACKEND).toBe("sdk");
+		});
+
+		test("config.proxyUrl overrides the injected base url", () => {
+			const onRuntime = new SaplingRuntime({
+				subscriptionProxy: true,
+				proxyUrl: "http://127.0.0.1:9100",
+			});
+			const env = onRuntime.buildEnv({ model: "sonnet" });
+			expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:9100");
+		});
+
+		test("proxy base url overrides any gateway-provided ANTHROPIC_BASE_URL", () => {
+			const onRuntime = new SaplingRuntime({ subscriptionProxy: true });
+			const env = onRuntime.buildEnv({
+				model: "sonnet",
+				env: { ANTHROPIC_BASE_URL: "https://gateway.example.com/v1" },
+			});
+			// Proxy wins — sapling must hit the local bearer proxy, not the gateway.
+			expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8788");
+			expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-proxy-dummy");
+		});
+
+		test("env fallback OV_SAPLING_SUBSCRIPTION_PROXY=1 enables injection when config absent", () => {
+			process.env[TOGGLE] = "1";
+			const offRuntime = new SaplingRuntime(); // no config — env drives it
+			const env = offRuntime.buildEnv({ model: "haiku" });
+			expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8788");
+			expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-proxy-dummy");
+		});
+
+		test("env OV_SAPLING_PROXY_URL is honored with the env toggle", () => {
+			process.env[TOGGLE] = "1";
+			process.env[PROXY_URL_ENV] = "http://127.0.0.1:8000";
+			const offRuntime = new SaplingRuntime();
+			const env = offRuntime.buildEnv({ model: "haiku" });
+			expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8000");
+		});
+
+		test("config.subscriptionProxy=false + env=1 → no injection (config wins, HIGH 2)", () => {
+			process.env[TOGGLE] = "1";
+			const offRuntime = new SaplingRuntime({ subscriptionProxy: false });
+			const env = offRuntime.buildEnv({ model: "haiku" });
+			expect("ANTHROPIC_BASE_URL" in env).toBe(false);
+			expect(env.ANTHROPIC_API_KEY).toBe("");
+		});
+
+		test("a non-loopback proxyUrl is REJECTED in buildEnv (token-leak guard, MEDIUM)", () => {
+			const evil = new SaplingRuntime({
+				subscriptionProxy: true,
+				proxyUrl: "http://evil.example.com:8788",
+			});
+			expect(() => evil.buildEnv({ model: "haiku" })).toThrow(/loopback/);
+		});
+	});
+
+	describe("preflightDirectSpawn (per-spawn readiness, HIGH 3)", () => {
+		const TOGGLE = "OV_SAPLING_SUBSCRIPTION_PROXY";
+		let savedToggle: string | undefined;
+		beforeEach(() => {
+			savedToggle = process.env[TOGGLE];
+			delete process.env[TOGGLE];
+		});
+		afterEach(() => {
+			if (savedToggle === undefined) delete process.env[TOGGLE];
+			else process.env[TOGGLE] = savedToggle;
+		});
+
+		test("no-op when subscription proxy is disabled (does not probe)", async () => {
+			const off = new SaplingRuntime({ subscriptionProxy: false });
+			// Must resolve without throwing and without needing a live proxy.
+			await expect(off.preflightDirectSpawn()).resolves.toBeUndefined();
+		});
+
+		test("rejects a non-loopback proxyUrl before any probe (token-leak guard)", async () => {
+			const evil = new SaplingRuntime({
+				subscriptionProxy: true,
+				proxyUrl: "http://evil.example.com:8788",
+			});
+			await expect(evil.preflightDirectSpawn()).rejects.toThrow(/loopback/);
+		});
+	});
+
 	describe("detectReady", () => {
 		test("returns { phase: 'ready' } for empty pane content", () => {
 			expect(runtime.detectReady("")).toEqual({ phase: "ready" });
@@ -696,7 +819,7 @@ describe("SaplingRuntime", () => {
 		});
 	});
 
-	describe("buildGuardsConfig (via deployConfig)", () => {
+	describe("buildGuardsConfig (via deployConfig) — sp 0.3.2 GuardConfig schema", () => {
 		let tempDir: string;
 
 		beforeEach(async () => {
@@ -713,79 +836,83 @@ describe("SaplingRuntime", () => {
 			return JSON.parse(text) as Record<string, unknown>;
 		}
 
-		test("version is 1", async () => {
-			const worktreePath = join(tempDir, "wt");
+		async function guardsFor(
+			capability: string,
+			agentName = `test-${capability}`,
+		): Promise<Record<string, unknown>> {
+			const worktreePath = join(tempDir, `wt-${capability}`);
 			await runtime.deployConfig(
 				worktreePath,
 				{ content: "# Overlay" },
-				{
-					agentName: "test-builder",
-					capability: "builder",
-					worktreePath,
-				},
+				{ agentName, capability, worktreePath },
 			);
-			const guards = await readGuards(worktreePath);
-			expect(guards.version).toBe(1);
+			return readGuards(worktreePath);
+		}
+
+		// --- sp's REQUIRED `rules` array (the bug: its absence makes sp throw
+		// `Guards file must have a "rules" array` and every sapling worker dies) ---
+
+		test("emits a `rules` array (REQUIRED by sp — empty is valid)", async () => {
+			const guards = await guardsFor("builder");
+			expect(Array.isArray(guards.rules)).toBe(true);
+			expect(guards.rules).toEqual([]);
 		});
 
-		test("agentName and capability are set correctly", async () => {
-			const worktreePath = join(tempDir, "wt");
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: "my-builder",
-					capability: "builder",
-					worktreePath,
-				},
-			);
-			const guards = await readGuards(worktreePath);
-			expect(guards.agentName).toBe("my-builder");
-			expect(guards.capability).toBe("builder");
+		test('version is the string "1" (sp\'s version is `version?: string`)', async () => {
+			const guards = await guardsFor("builder");
+			expect(guards.version).toBe("1");
+			expect(typeof guards.version).toBe("string");
 		});
+
+		// --- ov-only fields must NOT leak into the emitted (sp-only) json ---
+
+		test("does NOT emit ov-only fields sp doesn't define", async () => {
+			const guards = await guardsFor("builder");
+			for (const field of [
+				"agentName",
+				"capability",
+				"writeToolsBlocked",
+				"writeToolNames",
+				"qualityGates",
+				"bashGuards",
+				"safePrefixes",
+			]) {
+				expect(field in guards).toBe(false);
+			}
+		});
+
+		test("top-level keys are a subset of sp's GuardConfig shape", async () => {
+			const guards = await guardsFor("builder");
+			const allowed = new Set([
+				"version",
+				"rules",
+				"pathBoundary",
+				"fileScope",
+				"readOnly",
+				"blockedBashPatterns",
+				"blockedTools",
+				"eventConfig",
+			]);
+			for (const key of Object.keys(guards)) {
+				expect(allowed.has(key)).toBe(true);
+			}
+		});
+
+		// --- flat fields that match sp natively (preserved) ---
 
 		test("pathBoundary is set to worktreePath", async () => {
-			const worktreePath = join(tempDir, "wt");
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: "builder-1",
-					capability: "builder",
-					worktreePath,
-				},
-			);
-			const guards = await readGuards(worktreePath);
+			const worktreePath = join(tempDir, "wt-builder");
+			const guards = await guardsFor("builder");
 			expect(guards.pathBoundary).toBe(worktreePath);
 		});
 
 		test("readOnly is false for builder capability", async () => {
-			const worktreePath = join(tempDir, "wt-builder");
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: "test-builder",
-					capability: "builder",
-					worktreePath,
-				},
-			);
-			const guards = await readGuards(worktreePath);
+			const guards = await guardsFor("builder");
 			expect(guards.readOnly).toBe(false);
 		});
 
 		test("readOnly is false for merger capability", async () => {
-			const worktreePath = join(tempDir, "wt-merger");
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: "test-merger",
-					capability: "merger",
-					worktreePath,
-				},
-			);
-			const guards = await readGuards(worktreePath);
+			const guards = await guardsFor("merger");
 			expect(guards.readOnly).toBe(false);
 		});
 
@@ -797,208 +924,52 @@ describe("SaplingRuntime", () => {
 			"supervisor",
 			"monitor",
 		])("readOnly is true for %s capability", async (capability) => {
-			const worktreePath = join(tempDir, `wt-${capability}`);
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: `test-${capability}`,
-					capability,
-					worktreePath,
-				},
-			);
-			const guards = await readGuards(worktreePath);
+			const guards = await guardsFor(capability);
 			expect(guards.readOnly).toBe(true);
 		});
 
 		test("blockedTools = NATIVE_TEAM_TOOLS + INTERACTIVE_TOOLS", async () => {
-			const worktreePath = join(tempDir, "wt");
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: "test-builder",
-					capability: "builder",
-					worktreePath,
-				},
-			);
-			const guards = await readGuards(worktreePath);
-			const expected = [...NATIVE_TEAM_TOOLS, ...INTERACTIVE_TOOLS];
-			expect(guards.blockedTools).toEqual(expected);
+			const guards = await guardsFor("builder");
+			expect(guards.blockedTools).toEqual([...NATIVE_TEAM_TOOLS, ...INTERACTIVE_TOOLS]);
 		});
 
-		test("writeToolsBlocked is populated for scout (non-impl)", async () => {
-			const worktreePath = join(tempDir, "wt-scout");
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: "test-scout",
-					capability: "scout",
-					worktreePath,
-				},
-			);
-			const guards = await readGuards(worktreePath);
-			expect(Array.isArray(guards.writeToolsBlocked)).toBe(true);
-			expect((guards.writeToolsBlocked as string[]).length).toBeGreaterThan(0);
-		});
+		// --- flattened bash blocklist (ov's nested bashGuards → sp's flat list) ---
 
-		test("writeToolsBlocked is empty for builder (impl)", async () => {
-			const worktreePath = join(tempDir, "wt-builder");
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: "test-builder",
-					capability: "builder",
-					worktreePath,
-				},
-			);
-			const guards = await readGuards(worktreePath);
-			expect(guards.writeToolsBlocked).toEqual([]);
-		});
-
-		test("bashGuards has dangerousPatterns from DANGEROUS_BASH_PATTERNS", async () => {
-			const worktreePath = join(tempDir, "wt");
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: "test-builder",
-					capability: "builder",
-					worktreePath,
-				},
-			);
-			const guards = await readGuards(worktreePath);
-			const bash = guards.bashGuards as Record<string, unknown>;
-			expect(bash.dangerousPatterns).toEqual(DANGEROUS_BASH_PATTERNS);
-		});
-
-		test("bashGuards has safePrefixes from SAFE_BASH_PREFIXES", async () => {
-			const worktreePath = join(tempDir, "wt");
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: "test-builder",
-					capability: "builder",
-					worktreePath,
-				},
-			);
-			const guards = await readGuards(worktreePath);
-			const bash = guards.bashGuards as Record<string, unknown>;
-			const safePrefixes = bash.safePrefixes as string[];
-			// Should include all base safe prefixes
-			for (const prefix of SAFE_BASH_PREFIXES) {
-				expect(safePrefixes).toContain(prefix);
+		test("blockedBashPatterns is a FLAT string array (not nested)", async () => {
+			const guards = await guardsFor("builder");
+			expect(Array.isArray(guards.blockedBashPatterns)).toBe(true);
+			for (const p of guards.blockedBashPatterns as string[]) {
+				expect(typeof p).toBe("string");
 			}
 		});
 
-		test("bashGuards has fileModifyingPatterns", async () => {
-			const worktreePath = join(tempDir, "wt");
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: "test-builder",
-					capability: "builder",
-					worktreePath,
-				},
-			);
-			const guards = await readGuards(worktreePath);
-			const bash = guards.bashGuards as Record<string, unknown>;
-			expect(Array.isArray(bash.fileModifyingPatterns)).toBe(true);
-			expect((bash.fileModifyingPatterns as string[]).length).toBeGreaterThan(0);
-		});
-
-		test("coordinator gets git add/commit in safePrefixes", async () => {
-			const worktreePath = join(tempDir, "wt-coordinator");
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: "coordinator",
-					capability: "coordinator",
-					worktreePath,
-				},
-			);
-			const guards = await readGuards(worktreePath);
-			const bash = guards.bashGuards as Record<string, unknown>;
-			const safePrefixes = bash.safePrefixes as string[];
-			expect(safePrefixes).toContain("git add");
-			expect(safePrefixes).toContain("git commit");
-		});
-
-		test("builder does NOT get git add/commit in safePrefixes", async () => {
-			const worktreePath = join(tempDir, "wt-builder");
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: "test-builder",
-					capability: "builder",
-					worktreePath,
-				},
-			);
-			const guards = await readGuards(worktreePath);
-			const bash = guards.bashGuards as Record<string, unknown>;
-			const safePrefixes = bash.safePrefixes as string[];
-			expect(safePrefixes).not.toContain("git add");
-			expect(safePrefixes).not.toContain("git commit");
-		});
-
-		test("qualityGates uses DEFAULT_QUALITY_GATES when none provided", async () => {
-			const worktreePath = join(tempDir, "wt");
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: "test-builder",
-					capability: "builder",
-					worktreePath,
-				},
-			);
-			const guards = await readGuards(worktreePath);
-			const gates = guards.qualityGates as Array<{ name: string; command: string }>;
-			expect(gates.length).toBe(DEFAULT_QUALITY_GATES.length);
-			for (const gate of DEFAULT_QUALITY_GATES) {
-				const found = gates.find((g) => g.command === gate.command);
-				expect(found).toBeDefined();
-				expect(found?.name).toBe(gate.name);
+		test("blockedBashPatterns includes DANGEROUS_BASH_PATTERNS for every agent", async () => {
+			for (const cap of ["builder", "merger", "scout", "reviewer", "coordinator"]) {
+				const guards = await guardsFor(cap);
+				const patterns = guards.blockedBashPatterns as string[];
+				for (const dangerous of DANGEROUS_BASH_PATTERNS) {
+					expect(patterns).toContain(dangerous);
+				}
 			}
 		});
 
-		test("qualityGates uses custom gates when provided", async () => {
-			const worktreePath = join(tempDir, "wt-custom");
-			const customGates = [{ name: "Custom Test", command: "pytest", description: "run pytest" }];
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: "test-builder",
-					capability: "builder",
-					worktreePath,
-					qualityGates: customGates,
-				},
-			);
-			const guards = await readGuards(worktreePath);
-			const gates = guards.qualityGates as Array<{ name: string; command: string }>;
-			expect(gates.length).toBe(1);
-			expect(gates[0]?.command).toBe("pytest");
+		test("read-only agents ALSO block file-modifying bash patterns; impl agents do not", async () => {
+			// "\\brsync\\s" is a FILE_MODIFYING pattern that is NOT in DANGEROUS_BASH_PATTERNS,
+			// so it is the discriminator between the read-only and impl blocklists.
+			const fileModifyingOnly = "\\brsync\\s";
+			expect(DANGEROUS_BASH_PATTERNS).not.toContain(fileModifyingOnly);
+
+			const scout = await guardsFor("scout");
+			expect(scout.blockedBashPatterns as string[]).toContain(fileModifyingOnly);
+
+			const builder = await guardsFor("builder");
+			expect(builder.blockedBashPatterns as string[]).not.toContain(fileModifyingOnly);
 		});
+
+		// --- eventConfig (sp supports it natively) ---
 
 		test("eventConfig contains agent name in all event hooks", async () => {
-			const worktreePath = join(tempDir, "wt");
-			await runtime.deployConfig(
-				worktreePath,
-				{ content: "# Overlay" },
-				{
-					agentName: "my-agent",
-					capability: "builder",
-					worktreePath,
-				},
-			);
-			const guards = await readGuards(worktreePath);
+			const guards = await guardsFor("builder", "my-agent");
 			const events = guards.eventConfig as Record<string, string[]>;
 			expect(events.onToolStart).toContain("my-agent");
 			expect(events.onToolEnd).toContain("my-agent");

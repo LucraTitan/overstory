@@ -314,6 +314,22 @@ describe("ClaudeRuntime", () => {
 			const env = runtime.buildEnv(model);
 			expect(env).toEqual({});
 		});
+
+		test("NEVER injects a sapling subscription-proxy base url (claude is unaffected)", () => {
+			// The sapling subscription proxy is sapling-scoped. ClaudeRuntime.buildEnv must
+			// never set ANTHROPIC_BASE_URL to the proxy regardless of any ambient sapling
+			// env toggle — claude keeps its own (subscription) auth path.
+			const saved = process.env.OV_SAPLING_SUBSCRIPTION_PROXY;
+			process.env.OV_SAPLING_SUBSCRIPTION_PROXY = "1";
+			try {
+				const env = runtime.buildEnv({ model: "sonnet" });
+				expect("ANTHROPIC_BASE_URL" in env).toBe(false);
+				expect(env).toEqual({});
+			} finally {
+				if (saved === undefined) delete process.env.OV_SAPLING_SUBSCRIPTION_PROXY;
+				else process.env.OV_SAPLING_SUBSCRIPTION_PROXY = saved;
+			}
+		});
 	});
 
 	describe("deployConfig", () => {

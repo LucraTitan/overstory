@@ -907,6 +907,18 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 			worktreePath,
 			resumeSessionId: priorSessionId,
 		};
+
+		// Per-spawn readiness preflight (HIGH 3). Sapling is spawn-per-turn: later turns
+		// inherit the proxy env (ANTHROPIC_BASE_URL) but, without this, would skip the
+		// proxy-readiness check that sling.ts only ran for the FIRST dispatch — so a proxy
+		// that died between turns would fail silently. Runtimes that need a per-spawn
+		// precondition implement preflightDirectSpawn; it must be idempotent and cheap on
+		// the healthy path (sapling's is one localhost GET) and throws to abort the spawn
+		// when the precondition cannot be met. Absent → skipped.
+		if (runtime.preflightDirectSpawn) {
+			await runtime.preflightDirectSpawn();
+		}
+
 		const argv = runtime.buildDirectSpawn(directOpts);
 
 		const logTimestamp = now().toISOString().replace(/[:.]/g, "-");

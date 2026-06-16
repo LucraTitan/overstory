@@ -525,6 +525,25 @@ export async function startCoordinatorSession(
 				OVERSTORY_PROJECT_ROOT: projectRoot,
 				...(profileFlag ? { OVERSTORY_PROFILE: profileFlag } : {}),
 			};
+
+			// Per-spawn readiness preflight — same source of truth as sling.ts and the
+			// turn-runner. For sapling-with-subscription-proxy this health-checks the
+			// local bearer proxy (auto-starting it when down) and throws when it is
+			// squatted, token-less, or non-loopback — hard-failing the coordinator start
+			// rather than spawning a coordinator against a dead/misconfigured proxy (which
+			// would 401 mid-task). Without this, a coordinator-dispatched sapling+proxy
+			// worker bypasses the gate that sling.ts/turn-runner already enforce. Idempotent
+			// + cheap on the healthy path; runtimes without the method are no-ops.
+			if (runtime.preflightDirectSpawn) {
+				try {
+					await runtime.preflightDirectSpawn();
+				} catch (err) {
+					throw new AgentError(err instanceof Error ? err.message : String(err), {
+						agentName: coordinatorName,
+					});
+				}
+			}
+
 			const argv = runtime.buildDirectSpawn({
 				cwd: projectRoot,
 				env: directEnv,

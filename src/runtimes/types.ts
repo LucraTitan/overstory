@@ -293,6 +293,21 @@ export interface AgentRuntime {
 	readonly signalsCompletionViaEvents?: boolean;
 
 	/**
+	 * Per-spawn readiness preflight for the headless spawn-per-turn path. Invoked by
+	 * the turn-runner immediately before {@link buildDirectSpawn} on EVERY turn (and by
+	 * sling.ts before the first dispatch), so spawn-per-turn runtimes can verify external
+	 * preconditions that must hold for each spawn — not just the first.
+	 *
+	 * Sapling uses this to health-check its subscription bearer proxy before every worker
+	 * spawn (the proxy can die between turns; later turns merely inherit ANTHROPIC_BASE_URL
+	 * and would otherwise fail silently). Implementations MUST be idempotent and cheap on
+	 * the healthy path (sapling's is a single localhost GET) and MUST throw to abort the
+	 * spawn when the precondition cannot be met. Runtimes with no per-spawn precondition
+	 * omit this method (the turn-runner skips it when absent).
+	 */
+	preflightDirectSpawn?(): Promise<void>;
+
+	/**
 	 * Build the argv array for Bun.spawn() to launch a headless agent subprocess.
 	 * Only headless runtimes implement this method.
 	 * The returned array is passed directly to Bun.spawn() — no shell interpolation.
