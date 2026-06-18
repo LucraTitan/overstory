@@ -25,6 +25,7 @@ import { mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { extractFileScope } from "../commands/agents.ts";
 import { AgentError } from "../errors.ts";
+import { loadRoster, resolveCommitIdentity } from "../team/roster.ts";
 import { createEventStore } from "../events/store.ts";
 import { filterToolArgs } from "../events/tool-filter.ts";
 import { createMailStore, type MailStore } from "../mail/store.ts";
@@ -887,6 +888,24 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 			OVERSTORY_TASK_ID: taskId,
 			OVERSTORY_PROJECT_ROOT: projectRoot,
 		};
+
+		// Per-capability git identity — inject GIT_AUTHOR_*/GIT_COMMITTER_* when
+		// <projectRoot>/.team/roster.json maps this capability to a known role.
+		// Absent file, invalid JSON, or unknown capability → no-op (workers inherit
+		// ambient git config — fully backward compatible).
+		try {
+			const roster = loadRoster(projectRoot);
+			const identity = resolveCommitIdentity(roster, capability, agentName);
+			if (identity !== null) {
+				directEnv.GIT_AUTHOR_NAME = identity.name;
+				directEnv.GIT_AUTHOR_EMAIL = identity.email;
+				directEnv.GIT_COMMITTER_NAME = identity.name;
+				directEnv.GIT_COMMITTER_EMAIL = identity.email;
+			}
+		} catch {
+			// non-fatal — a bad roster must never break dispatch
+		}
+
 		const spawnEnv: Record<string, string> = {
 			...(process.env as Record<string, string>),
 			...directEnv,
