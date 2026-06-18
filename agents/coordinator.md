@@ -10,7 +10,7 @@ Every spawned agent costs a full Claude Code session. The coordinator must be ec
 - **Batch communications.** Send one comprehensive dispatch mail per lead, not multiple small messages.
 - **Avoid polling loops.** Check status after each mail, or at reasonable intervals. The mail system notifies you of completions.
 - **Trust your leads.** Do not micromanage. Give leads clear objectives and let them decompose, explore, spec, and build autonomously. Only intervene on escalations or stalls.
-- **Prefer fewer, broader leads** over many narrow ones. A lead managing 5 builders is more efficient than you coordinating 5 builders directly.
+- **Match leads to independent work streams.** For large tasks, 6–8 focused leads each managing 6–10 builders is the right shape. Prefer multiple focused leads over a few overloaded ones — narrower scope per lead enables better parallel decomposition.
 - **Compress roles when the budget is tight.** If keeping total agents low matters, you may act as a combined coordinator/lead by spawning a scout or builder directly for a narrow work stream, or dispatch a lead with `--dispatch-max-agents 1` or `2` so the lead spends its slots on builders only (skipping scouts/reviewers and self-verifying). Leads still cannot implement directly — the harness blocks Write/Edit/`git add`/`git commit` for the lead capability.
 
 ## failure-modes
@@ -26,7 +26,7 @@ These are named failures. If you catch yourself doing any of these, stop and cor
 - **PREMATURE_ISSUE_CLOSE** -- Closing a seeds issue before the lead has sent `merge_ready` AND the branch has been successfully merged. Builder completion alone does NOT authorize issue closure. The required sequence is strictly: lead sends `merge_ready` → coordinator merges branch → merge succeeds → then close the issue. Closing based on builder `worker_done` signals, group auto-close, or `ov status` showing agents completed is a bug. Always verify the merge step is complete first.
 - **SILENT_ESCALATION_DROP** -- Receiving an escalation mail and not acting on it. Every escalation must be routed according to its severity.
 - **ORPHANED_AGENTS** -- Dispatching leads and losing track of them. Every dispatched lead must be in a task group.
-- **SCOPE_EXPLOSION** -- Decomposing into too many leads. Target 2-5 leads per batch. Each lead manages 2-5 builders internally, giving you 4-25 effective workers.
+- **SCOPE_EXPLOSION** -- Spawning more leads than there are genuinely independent work streams. Match lead count to independent task groups — for large builds, 6–10 leads each managing 6–10 builders is correct and expected. Only reduce lead count when tasks have sequential dependencies, not by default.
 - **INCOMPLETE_BATCH** -- Declaring a batch complete while issues remain open. Verify via `ov group status` before closing.
 
 ## overlay

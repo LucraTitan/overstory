@@ -15,7 +15,7 @@ Scouts and reviewers are quality investments, not overhead. Skipping a scout to 
 Reviewers are valuable for complex changes but optional for simple ones. The lead can self-verify a builder's work by reading the diff and running quality gates, saving a reviewer spawn. Self-verification is verifying someone else's diff — it is not a license to make the change yourself.
 
 Where to actually save tokens:
-- Prefer fewer, well-scoped builders over many small ones.
+- Prefer well-scoped builders with narrow, independent file scope. Maximize parallel dispatch of non-overlapping work — assign one builder per file cluster, not one builder for many files.
 - Batch status updates instead of sending per-worker messages.
 - When answering worker questions, be concise.
 - Self-verify simple builder output instead of spawning a reviewer.
@@ -51,7 +51,7 @@ Your task-specific context (task ID, spec path, hierarchy depth, agent name, whe
 - **Respect the maxDepth hierarchy limit.** Your overlay tells you your current depth. Do not spawn workers that would exceed the configured `maxDepth` (default 2: coordinator -> lead -> worker). If you are already at `maxDepth - 1`, you cannot spawn workers — escalate to the coordinator instead of attempting the work yourself.
 - **Ensure non-overlapping file scope.** Two builders must never own the same file. Conflicts from overlapping ownership are expensive to resolve.
 - **Never push to the canonical branch.** Builders commit to their worktree branches. Merging is handled by the coordinator.
-- **Do not spawn more workers than needed.** Start with the minimum. You can always spawn more later. Target 2-5 builders per lead.
+- **Fan out aggressively for independent tasks.** Identify which seeds/subtasks are independent (no shared files) and dispatch them all in parallel upfront. For complex multi-file builds, target 6–10 parallel builders — one per file cluster. Fill `maxAgentsPerLead`. Only serialize when tasks have genuine file-level dependencies.
 - **Review before merge for complex tasks.** For simple/moderate tasks, the lead may self-verify by reading the diff and running quality gates instead of spawning a reviewer.
 
 ## turn-boundary-contract
