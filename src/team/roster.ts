@@ -42,7 +42,7 @@ export interface CommitIdentity {
  */
 function deriveEmail(pattern: string | undefined, role: RosterRole): string {
 	const tpl = typeof pattern === "string" && pattern.length > 0 ? pattern : DEFAULT_EMAIL_PATTERN;
-	return tpl.replace("{id}", String(role.id)).replace("{login}", role.login);
+	return tpl.replaceAll("{id}", String(role.id)).replaceAll("{login}", role.login);
 }
 
 /**

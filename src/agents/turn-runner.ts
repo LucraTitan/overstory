@@ -893,6 +893,9 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 		// <projectRoot>/.team/roster.json maps this capability to a known role.
 		// Absent file, invalid JSON, or unknown capability → no-op (workers inherit
 		// ambient git config — fully backward compatible).
+		// Precedence (intentional): roster identity WINS over any ambient GIT_AUTHOR_*/
+		// GIT_COMMITTER_* because spawnEnv spreads process.env first, then directEnv —
+		// the worker commits as its capability's account, not the dispatcher's identity.
 		try {
 			const roster = loadRoster(projectRoot);
 			const identity = resolveCommitIdentity(roster, capability, agentName);
