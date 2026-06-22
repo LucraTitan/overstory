@@ -24,24 +24,32 @@ export function encodeUserTurn(text: string): string {
 /**
  * Build the initial stdin prompt for a headless Claude agent.
  *
- * Combines prime context (mulch expertise, session state), pending dispatch mail,
- * and the activation beacon into a single user turn. Replaces the SessionStart
- * hook equivalents (ov prime + ov mail check --inject) for headless agents.
+ * Combines prime context (mulch expertise, session state), optional task spec
+ * content, pending dispatch mail, and the activation beacon into a single user
+ * turn. Replaces the SessionStart hook equivalents (ov prime + ov mail check
+ * --inject) for headless agents.
  *
  * Sections are separated by "---" dividers. Empty sections are omitted.
  *
  * @param primeContext - Output of `ov prime --agent <name>` (may be empty/undefined)
  * @param dispatchMail - Pre-formatted dispatch mail body (may be empty/undefined)
  * @param beacon - Activation phrase sent via tmux send-keys in interactive mode
+ * @param specContent - Full text of the task spec file (may be undefined when no spec)
  * @returns NDJSON line ready to write to the agent's stdin
  */
 export function buildInitialHeadlessPrompt(
 	primeContext: string | undefined,
 	dispatchMail: string | undefined,
 	beacon: string,
+	specContent?: string,
 ): string {
 	const parts: string[] = [];
 	if (primeContext) parts.push(primeContext);
+	if (specContent) {
+		parts.push(
+			`## Task Specification (AUTHORITATIVE — follow exactly; deviations are bugs)\n\n${specContent}`,
+		);
+	}
 	if (dispatchMail) parts.push(dispatchMail);
 	parts.push(beacon);
 
