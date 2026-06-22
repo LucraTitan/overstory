@@ -1,14 +1,18 @@
 /**
  * Side-effect-free conflict prediction for `ov merge --dry-run`.
  *
- * Uses `git merge-tree --write-tree --merge-base=<base> <ours> <theirs>` to
- * compute the conflict set without mutating HEAD, the working tree, or the
- * merge lock. Each conflict file is classified into a predicted resolution
- * tier by reusing the same primitives that the actual resolver uses
- * (`hasContentfulCanonical`, `checkMergeUnion`), so prediction stays in lock
- * step with how `ov merge` would actually behave at runtime.
+ * Primary path (git >= 2.38): `git merge-tree --write-tree --merge-base=<base> <ours> <theirs>`.
+ * Fallback path (git < 2.38): legacy `git merge-tree <base-tree> <ours> <theirs>` (3-arg form).
+ *   The legacy form emits conflict-marker diffs to stdout but does not mutate HEAD,
+ *   the working tree, or the merge lock — same safety guarantee as the new form.
+ * Degraded path: when even the legacy form errors (e.g. missing git), returns a
+ *   conservative prediction (ai-resolve, wouldRequireAgent=true) with a structured
+ *   reason instead of throwing.
  *
- * Requires git >= 2.38 for `merge-tree --write-tree`.
+ * Each conflict file is classified into a predicted resolution tier by reusing the
+ * same primitives that the actual resolver uses (`hasContentfulCanonical`,
+ * `checkMergeUnion`), so prediction stays in lock step with how `ov merge` would
+ * actually behave at runtime.
  */
 
 import { MergeError } from "../errors.ts";
@@ -20,6 +24,10 @@ import {
 	hasContentfulCanonical,
 	parseConflictPatterns,
 } from "./resolver.ts";
+import {
+	parseLegacyMergeTreeOutput,
+	supportsWriteTree,
+} from "./git-version.ts";
 
 /** Run a git command in the given repo root. Returns stdout, stderr, exit code. */
 async function runGit(
@@ -66,13 +74,17 @@ async function findMergeBase(
 }
 
 interface MergeTreeOutput {
+	/**
+	 * Tree OID produced by `--write-tree` (new git form).
+	 * Empty string when using the legacy 3-arg fallback (no tree is written).
+	 */
 	treeOid: string;
 	conflictPaths: string[];
 	exitCode: number;
 }
 
 /**
- * Run `git merge-tree --write-tree` and parse the conflict info section.
+ * Run `git merge-tree --write-tree` (git >= 2.38) and parse the conflict info section.
  *
  * Output format (per git-merge-tree(1) --write-tree):
  *   <tree-oid>
@@ -81,8 +93,9 @@ interface MergeTreeOutput {
  *   <Informational messages>*
  *
  * Each conflicted file info line is `<mode> <object> <stage>\t<path>`.
+ * Exit 0 = clean merge; exit 1 = conflicts present; exit > 1 = error.
  */
-async function runMergeTree(
+async function runMergeTreeNewForm(
 	repoRoot: string,
 	base: string,
 	ours: string,
@@ -129,11 +142,103 @@ async function runMergeTree(
 	};
 }
 
+/**
+ * Run legacy `git merge-tree <base-tree> <ours> <theirs>` (3-arg form, all git versions).
+ *
+ * This form does not write a tree — it outputs conflict-marker diffs to stdout.
+ * Exit code is always 0 regardless of conflicts (only errors produce non-zero exit).
+ * We parse stdout for conflict markers to classify the outcome.
+ */
+async function runMergeTreeLegacyForm(
+	repoRoot: string,
+	base: string,
+	ours: string,
+	theirs: string,
+): Promise<MergeTreeOutput> {
+	const { stdout, stderr, exitCode } = await runGit(repoRoot, [
+		"merge-tree",
+		base,
+		ours,
+		theirs,
+	]);
+
+	if (exitCode !== 0) {
+		throw new MergeError(
+			`git merge-tree (legacy) failed (exit ${exitCode}): ${stderr.trim() || "no error output"}`,
+			{ branchName: theirs },
+		);
+	}
+
+	const conflictPaths = parseLegacyMergeTreeOutput(stdout);
+
+	return {
+		// Legacy form produces no tree OID — callers must not use readFromTree().
+		treeOid: "",
+		conflictPaths,
+		// Legacy form always exits 0; synthesize exit code based on conflicts found.
+		exitCode: conflictPaths.length > 0 ? 1 : 0,
+	};
+}
+
+/**
+ * Run `git merge-tree` using the best available form for the installed git.
+ *
+ * - git >= 2.38: `--write-tree` form (treeOid usable for readFromTree).
+ * - git < 2.38: legacy 3-arg form (treeOid will be empty; content checks skipped).
+ * - Error in legacy form: throws MergeError (caller maps to degraded result).
+ *
+ * @param forceWriteTreeCapability When defined, overrides the `supportsWriteTree` check.
+ *   Used by `predictConflictsInternal` to exercise both paths in tests.
+ */
+async function runMergeTree(
+	repoRoot: string,
+	base: string,
+	ours: string,
+	theirs: string,
+	forceWriteTreeCapability?: boolean,
+): Promise<MergeTreeOutput & { legacyFallback: boolean }> {
+	const useWriteTree =
+		forceWriteTreeCapability !== undefined
+			? forceWriteTreeCapability
+			: await supportsWriteTree(runGit, repoRoot);
+	if (useWriteTree) {
+		const result = await runMergeTreeNewForm(repoRoot, base, ours, theirs);
+		return { ...result, legacyFallback: false };
+	}
+	const result = await runMergeTreeLegacyForm(repoRoot, base, ours, theirs);
+	return { ...result, legacyFallback: true };
+}
+
 /** Read a file's content from a tree OID. Returns "" when the file is absent. */
 async function readFromTree(repoRoot: string, treeOid: string, path: string): Promise<string> {
 	const { stdout, exitCode } = await runGit(repoRoot, ["show", `${treeOid}:${path}`]);
 	if (exitCode !== 0) return "";
 	return stdout;
+}
+
+/**
+ * Internal version of predictConflicts that accepts a capability flag for testing.
+ *
+ * When `forceWriteTreeCapability` is provided it overrides the `supportsWriteTree`
+ * check so tests can exercise both code paths (new form vs. legacy fallback vs.
+ * degraded) without spawning a different git binary.
+ *
+ * @internal — only exported for unit testing. Production callers use `predictConflicts`.
+ */
+export async function predictConflictsInternal(
+	entry: MergeEntry,
+	canonicalBranch: string,
+	repoRoot: string,
+	mulchClient?: MulchClient,
+	forceWriteTreeCapability?: boolean,
+): Promise<ConflictPrediction> {
+	return predictConflictsImpl(
+		entry,
+		canonicalBranch,
+		repoRoot,
+		mulchClient,
+		forceWriteTreeCapability,
+	);
 }
 
 /**
@@ -154,6 +259,16 @@ export async function predictConflicts(
 	canonicalBranch: string,
 	repoRoot: string,
 	mulchClient?: MulchClient,
+): Promise<ConflictPrediction> {
+	return predictConflictsImpl(entry, canonicalBranch, repoRoot, mulchClient);
+}
+
+async function predictConflictsImpl(
+	entry: MergeEntry,
+	canonicalBranch: string,
+	repoRoot: string,
+	mulchClient?: MulchClient,
+	forceWriteTreeCapability?: boolean,
 ): Promise<ConflictPrediction> {
 	// Validate refs upfront so a missing branch produces a clear error
 	// instead of a confusing merge-base or merge-tree failure.
@@ -179,9 +294,21 @@ export async function predictConflicts(
 		};
 	}
 
-	const mergeOutput = await runMergeTree(repoRoot, baseOid, oursOid, theirsOid);
+	let mergeOutput: Awaited<ReturnType<typeof runMergeTree>>;
+	try {
+		mergeOutput = await runMergeTree(repoRoot, baseOid, oursOid, theirsOid, forceWriteTreeCapability);
+	} catch {
+		// Both merge-tree forms failed (unsupported git build or unexpected error).
+		// Return a conservative prediction so callers never auto-clean-merge blindly.
+		return {
+			predictedTier: "ai-resolve",
+			conflictFiles: [],
+			wouldRequireAgent: true,
+			reason: "git-merge-tree-unsupported: cannot predict conflicts; treating as ai-resolve",
+		};
+	}
 
-	if (mergeOutput.exitCode === 0 || mergeOutput.conflictPaths.length === 0) {
+	if (mergeOutput.conflictPaths.length === 0) {
 		return {
 			predictedTier: "clean-merge",
 			conflictFiles: [],
@@ -198,6 +325,16 @@ export async function predictConflicts(
 		// when merge-tree surfaces them as conflicts (the .gitattributes may
 		// only exist in the working tree; check-attr respects that).
 		if (await checkMergeUnion(repoRoot, file)) continue;
+
+		// When using the legacy fallback we have no tree OID to read from — the
+		// legacy form does not write a tree. Skip the canonical-content check and
+		// conservatively treat the file as blocking (ai-resolve). This errs on the
+		// safe side: a false positive ai-resolve is always preferable to a missed
+		// conflict that auto-clean-merges incorrectly.
+		if (mergeOutput.legacyFallback) {
+			blockingFiles.push(file);
+			continue;
+		}
 
 		const merged = await readFromTree(repoRoot, mergeOutput.treeOid, file);
 		if (hasContentfulCanonical(merged)) {
