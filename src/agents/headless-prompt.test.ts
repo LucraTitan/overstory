@@ -99,4 +99,51 @@ describe("buildInitialHeadlessPrompt", () => {
 		expect(result).toEndWith("\n");
 		expect(() => JSON.parse(result.trim())).not.toThrow();
 	});
+
+	test("includes spec content before mail section when specContent is provided", () => {
+		const specContent = "# My Task Spec\n\nDo exactly this thing.";
+		const result = buildInitialHeadlessPrompt(
+			"## Prime Context",
+			"[MAIL] From: orchestrator\n\nTask body.",
+			"Begin.",
+			specContent,
+		);
+		const parsed = JSON.parse(result.trim());
+		const text: string = parsed.message.content[0].text;
+		// Spec content must be present
+		expect(text).toContain("My Task Spec");
+		expect(text).toContain("Do exactly this thing.");
+		// Must be clearly delimited with an authoritative header
+		expect(text).toContain("Task Specification");
+		expect(text).toContain("AUTHORITATIVE");
+		// Mail and beacon must still be present
+		expect(text).toContain("[MAIL]");
+		expect(text).toContain("Begin.");
+		// Spec section must appear before mail section
+		expect(text.indexOf("Task Specification")).toBeLessThan(text.indexOf("[MAIL]"));
+	});
+
+	test("omits spec section when specContent is undefined", () => {
+		const result = buildInitialHeadlessPrompt(
+			"## Prime Context",
+			"[MAIL] From: orchestrator\n\nTask body.",
+			"Begin.",
+			undefined,
+		);
+		const parsed = JSON.parse(result.trim());
+		const text: string = parsed.message.content[0].text;
+		expect(text).not.toContain("Task Specification");
+		expect(text).not.toContain("AUTHORITATIVE");
+		expect(text).toContain("[MAIL]");
+		expect(text).toContain("Begin.");
+	});
+
+	test("omits spec section when specContent is omitted (backward compat)", () => {
+		// Called with 3 args — existing callers are unaffected
+		const result = buildInitialHeadlessPrompt("ctx", "mail", "go");
+		const parsed = JSON.parse(result.trim());
+		const text: string = parsed.message.content[0].text;
+		expect(text).not.toContain("Task Specification");
+		expect(text).not.toContain("AUTHORITATIVE");
+	});
 });

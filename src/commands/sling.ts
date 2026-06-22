@@ -657,6 +657,7 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 	// Validate that spec file exists if provided, and resolve to absolute path
 	// so agents in worktrees can access it (worktrees don't have .overstory/)
 	let absoluteSpecPath: string | null = null;
+	let specContent: string | undefined;
 	if (specPath !== null) {
 		absoluteSpecPath = resolve(specPath);
 		const specFile = Bun.file(absoluteSpecPath);
@@ -667,6 +668,9 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 				value: specPath,
 			});
 		}
+		// Read spec content so it can be injected directly into the headless
+		// agent's initial prompt — the path reference alone is frequently ignored.
+		specContent = await specFile.text();
 	}
 
 	const fileScope = filesRaw
@@ -1124,6 +1128,7 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 						mulchExpertise,
 						mailSection || undefined,
 						beacon,
+						specContent,
 					);
 				} finally {
 					pendingMailStore.close();
