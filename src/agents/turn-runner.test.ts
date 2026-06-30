@@ -3088,4 +3088,172 @@ describe("runTurn model-pin via alwaysApplyResolvedModel", () => {
 			expect(capturedOpts[0]?.model).toBe("claude-opus-4-8");
 		}
 	});
+
+	// ── seed 9c0f: CC 2.1.193 extended-thinking watchdog bypass ─────────────
+
+	test("stall watchdog: thinking_tokens keepalives alone do NOT reset stall timer (seed 9c0f)", async () => {
+		// Pre-fix: CC 2.1.193 floods thinking_tokens system events during extended
+		// thinking. armStallTimer() was called on EVERY event, so keepalives
+		// continuously reset the stall timer — masking a genuinely hung process
+		// (0 commits, silent zombie). After the fix, thinking_tokens events are
+		// not real progress and must NOT reset the timer; watchdog fires on schedule.
+		//
+		// Test design: keepalives flow every 5ms for 500ms (100 events) — much
+		// longer than the 60ms stall timeout. The race gate (200ms) detects whether
+		// the stall fires quickly (fixed) or is masked indefinitely (pre-fix).
+		seedSession(ctx.sessionsDbPath, { agentName: "keepalive-stall", state: "booting" });
+		const { runtime } = makeSpyRuntime();
+
+		const ac = new AbortController();
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			(async () => {
+				let i = 0;
+				// Emit keepalives continuously until the process is killed (by the
+				// stall watchdog). The stall watchdog calls proc.kill() which closes
+				// the fake's stdout, exiting this loop via the closed controller.
+				while (!fake._killed) {
+					await Bun.sleep(5);
+					if (fake._killed) break;
+					fake._pushLine(
+						JSON.stringify({
+							type: "system",
+							subtype: "thinking_tokens",
+							estimated_tokens: ++i * 10,
+							estimated_tokens_delta: 10,
+							session_id: "keepalive-session",
+						}),
+					);
+				}
+			})();
+			return fake;
+		};
+
+		const errors: Array<{ level: string; message: string }> = [];
+		const logger: RunnerLogger = (level, message) => {
+			errors.push({ level, message });
+		};
+
+		// Race: stall must fire within 200ms (3× budget + slack).
+		// Pre-fix: keepalives reset the timer every 5ms → stall never fires →
+		//   race times out at 200ms → abortSignal fires → runTurn returns with
+		//   stallAborted=false → first expect() fails (RED).
+		// Post-fix: keepalives don't reset timer → stall fires at ~60ms →
+		//   runTurn returns → race resolves with result (GREEN).
+		type Race = { timedOut: false; result: Awaited<ReturnType<typeof runTurn>> } | { timedOut: true };
+		const race = await Promise.race<Race>([
+			runTurn({
+				...makeRunOpts(ctx, "keepalive-stall", {
+					runtime,
+					_spawnFn: spawnFn,
+					_logWarning: logger,
+					abortSignal: ac.signal,
+				}),
+				eventStallTimeoutMs: 60,
+				sigkillDelayMs: 25,
+			}).then((result) => ({ timedOut: false as const, result })),
+			new Promise<Race>((resolve) =>
+				setTimeout(() => {
+					ac.abort(); // clean up runTurn on timeout path
+					resolve({ timedOut: true });
+				}, 200),
+			),
+		]);
+
+		expect(race.timedOut).toBe(false);
+		if (race.timedOut) return; // type narrowing for assertions below
+
+		expect(race.result.stallAborted).toBe(true);
+		expect(fake._killSignals[0]).toBe("SIGTERM");
+		const stallLog = errors.find(
+			(e) => e.level === "error" && e.message.includes("parser stalled"),
+		);
+		expect(stallLog).toBeDefined();
+	});
+
+	test("stall watchdog: real events still reset timer when interleaved with keepalives (seed 9c0f)", async () => {
+		// Guard against over-gating: a turn that emits keepalives between real
+		// chunks of work must not be killed. Only keepalive-only gaps trigger
+		// the watchdog; real events (assistant_message, result) still reset it.
+		seedSession(ctx.sessionsDbPath, { agentName: "keepalive-live", state: "booting" });
+		const { runtime } = makeSpyRuntime();
+
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			(async () => {
+				const sessionId = "keepalive-live-session";
+				fake._pushLine(
+					JSON.stringify({
+						type: "system",
+						subtype: "thinking_tokens",
+						estimated_tokens: 50,
+						estimated_tokens_delta: 50,
+						session_id: sessionId,
+					}),
+				);
+				fake._pushLine(
+					JSON.stringify({
+						type: "assistant",
+						message: {
+							role: "assistant",
+							content: [{ type: "text", text: "working..." }],
+						},
+						session_id: sessionId,
+					}),
+				);
+				await Bun.sleep(20);
+				fake._pushLine(
+					JSON.stringify({
+						type: "system",
+						subtype: "thinking_tokens",
+						estimated_tokens: 100,
+						estimated_tokens_delta: 50,
+						session_id: sessionId,
+					}),
+				);
+				emitFakeTurn(fake, { sessionId });
+				fake._exit(0);
+			})();
+			return fake;
+		};
+
+		const result = await runTurn({
+			...makeRunOpts(ctx, "keepalive-live", {
+				runtime,
+				_spawnFn: spawnFn,
+			}),
+			eventStallTimeoutMs: 200,
+			sigkillDelayMs: 25,
+		});
+
+		expect(result.stallAborted).toBe(false);
+		expect(result.cleanResult).toBe(true);
+	});
+
+	test("worker spawn env disables adaptive thinking for headless workers (seed 9c0f)", async () => {
+		// CC 2.1.193 adaptive/extended thinking floods keepalive events that
+		// masked hung workers. Prevention: disable it for ov workers via
+		// CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1, overriding the parent setting.
+		seedSession(ctx.sessionsDbPath, { agentName: "env-check", state: "booting" });
+		const { runtime } = makeSpyRuntime();
+
+		const capturedEnvs: Array<Record<string, string>> = [];
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = (cmd, opts) => {
+			capturedEnvs.push(opts.env);
+			emitFakeTurn(fake, { sessionId: "env-check-session" });
+			fake._exit(0);
+			return fake;
+		};
+
+		await runTurn({
+			...makeRunOpts(ctx, "env-check", {
+				runtime,
+				_spawnFn: spawnFn,
+			}),
+		});
+
+		expect(capturedEnvs.length).toBeGreaterThanOrEqual(1);
+		expect(capturedEnvs[0]?.CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING).toBe("1");
+	});
 });
