@@ -3134,6 +3134,10 @@ describe("runTurn model-pin via alwaysApplyResolvedModel", () => {
 			errors.push({ level, message });
 		};
 
+		// Track lastActivity refreshes — keepalives must not trigger any.
+		let lastActivityRefreshCount = 0;
+		const onLastActivityRefresh = () => { lastActivityRefreshCount++; };
+
 		// Race: stall must fire within 200ms (3× budget + slack).
 		// Pre-fix: keepalives reset the timer every 5ms → stall never fires →
 		//   race times out at 200ms → abortSignal fires → runTurn returns with
@@ -3151,6 +3155,7 @@ describe("runTurn model-pin via alwaysApplyResolvedModel", () => {
 				}),
 				eventStallTimeoutMs: 60,
 				sigkillDelayMs: 25,
+				_onLastActivityRefresh: onLastActivityRefresh,
 			}).then((result) => ({ timedOut: false as const, result })),
 			new Promise<Race>((resolve) =>
 				setTimeout(() => {
@@ -3169,6 +3174,8 @@ describe("runTurn model-pin via alwaysApplyResolvedModel", () => {
 			(e) => e.level === "error" && e.message.includes("parser stalled"),
 		);
 		expect(stallLog).toBeDefined();
+		// lastActivity must not advance on keepalive-only events (seed 9c0f LOW fix).
+		expect(lastActivityRefreshCount).toBe(0);
 	});
 
 	test("stall watchdog: real events still reset timer when interleaved with keepalives (seed 9c0f)", async () => {
