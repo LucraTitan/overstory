@@ -887,6 +887,12 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 			OVERSTORY_WORKTREE_PATH: worktreePath,
 			OVERSTORY_TASK_ID: taskId,
 			OVERSTORY_PROJECT_ROOT: projectRoot,
+			// Disable CC adaptive/extended thinking for ov workers (seed 9c0f).
+			// CC 2.1.193 introduced extended thinking that floods thinking_tokens
+			// keepalives, which previously masked hung processes by continuously
+			// resetting the stall watchdog. Disabling it is the claude-side cure;
+			// directEnv wins over process.env so this overrides any parent setting.
+			CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: "1",
 		};
 
 		// Per-capability git identity — inject GIT_AUTHOR_*/GIT_COMMITTER_* when
@@ -1193,14 +1199,25 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 			let lastActivityRefreshMs = 0; // first event always refreshes
 
 			for await (const event of parser) {
-				armStallTimer();
+				// thinking_tokens keepalives (CC 2.1.193+) must NOT reset the stall
+				// timer or lastActivity — they are stream heartbeats emitted during
+				// extended thinking, not real agent progress. Without this gate a hung
+				// mid-extended-thinking process stays alive indefinitely, masked by a
+				// continuous keepalive stream (seed 9c0f).
+				const isKeepalive =
+					event.type === "status" &&
+					(event as Record<string, unknown>).subtype === "thinking_tokens";
+				if (!isKeepalive) {
+					armStallTimer();
+				}
 				observedAnyEvent = true;
 
 				// Keep `session.lastActivity` advancing while events flow so the
 				// watchdog does not zombify a live agent mid-turn — see
 				// `src/watchdog/health.ts:242-243` and overstory-8e61.
+				// Gate on non-keepalive events for the same reason as armStallTimer.
 				const nowMs = now().getTime();
-				if (nowMs - lastActivityRefreshMs >= lastActivityRefreshIntervalMs) {
+				if (!isKeepalive && nowMs - lastActivityRefreshMs >= lastActivityRefreshIntervalMs) {
 					lastActivityRefreshMs = nowMs;
 					updateSessionLastActivity(sessionsDbPath, agentName, (err) =>
 						runnerLog("warn", "failed to refresh lastActivity mid-turn", err),
