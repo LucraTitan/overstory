@@ -8,6 +8,7 @@
 			"!**/.overstory",
 			"!**/.pi",
 			"!**/.sapling",
+			"!**/.omx",
 			"!**/node_modules"
 		]
 	},
