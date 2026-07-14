@@ -20,11 +20,11 @@
 
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { buildInitialHeadlessPrompt, formatMailSection } from "../agents/headless-prompt.ts";
+import { type BeaconOptions, buildBeacon } from "../agents/beacon.ts";
+import { spawnHeadlessSession } from "../agents/headless-session.ts";
 import { createIdentity, loadIdentity } from "../agents/identity.ts";
 import { createManifestLoader, resolveModel } from "../agents/manifest.ts";
 import { writeOverlay } from "../agents/overlay.ts";
-import { runTurn } from "../agents/turn-runner.ts";
 import { createCanopyClient } from "../canopy/client.ts";
 import { loadConfig } from "../config.ts";
 import { AgentError, HierarchyError, ValidationError } from "../errors.ts";
@@ -52,6 +52,15 @@ import {
 	sendKeys,
 	waitForTuiReady,
 } from "../worktree/tmux.ts";
+
+// Re-exported so existing importers of `buildBeacon`/`BeaconOptions` from
+// `./sling.ts` (e.g. sling.test.ts) keep working unchanged. The definitions
+// live in `../agents/beacon.ts` — moved out during the ov-drive-completion
+// Phase 1 `spawnHeadlessSession` extraction to avoid a circular import
+// (`../agents/headless-session.ts` needs `buildBeacon` too, and this module
+// imports `spawnHeadlessSession` from it).
+export { buildBeacon };
+export type { BeaconOptions };
 
 /**
  * Calculate how many milliseconds to sleep before spawning a new agent,
@@ -271,45 +280,6 @@ export function buildAutoDispatch(opts: AutoDispatchOptions): {
 		subject: `Dispatch: ${opts.taskId}`,
 		body,
 	};
-}
-
-/**
- * Options for building the structured startup beacon.
- */
-export interface BeaconOptions {
-	agentName: string;
-	capability: string;
-	taskId: string;
-	parentAgent: string | null;
-	depth: number;
-	instructionPath: string;
-}
-
-/**
- * Build a structured startup beacon for an agent.
- *
- * The beacon is the first user message sent to a Claude Code agent via
- * tmux send-keys. It provides identity context and a numbered startup
- * protocol so the agent knows exactly what to do on boot.
- *
- * Format:
- *   [OVERSTORY] <agent-name> (<capability>) <ISO timestamp> task:<task-id>
- *   Depth: <n> | Parent: <parent-name|none>
- *   Startup protocol:
- *   1. Read your assignment in .claude/CLAUDE.md
- *   2. Load expertise: mulch prime
- *   3. Check mail: ov mail check --agent <name>
- *   4. Begin working on task <task-id>
- */
-export function buildBeacon(opts: BeaconOptions): string {
-	const timestamp = new Date().toISOString();
-	const parent = opts.parentAgent ?? "none";
-	const parts = [
-		`[OVERSTORY] ${opts.agentName} (${opts.capability}) ${timestamp} task:${opts.taskId}`,
-		`Depth: ${opts.depth} | Parent: ${parent}`,
-		`Startup: read ${opts.instructionPath}, run mulch prime, check mail (ov mail check --agent ${opts.agentName}), then begin task ${opts.taskId}`,
-	];
-	return parts.join(" — ");
 }
 
 /**
@@ -1077,106 +1047,33 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 			if (useHeadless && runtime.buildDirectSpawn) {
 				// Phase 3 spawn-per-turn: headless agents have NO long-lived process.
 				// sling builds the initial prompt, upserts the session row in
-				// "booting", then drives the first user turn synchronously through
-				// `runTurn`. The runner spawns claude with `--resume` (when a prior
-				// session id exists), writes the prompt to a real stdin pipe, drains
-				// stream-json, captures session id, transitions state to "working"
-				// (or "completed" if terminal mail observed), and exits. No persistent
-				// process remains after this returns; subsequent turns are driven by
-				// `ov serve` (mail) or `ov nudge`.
-				// `existingSession` was captured during the name-collision check (above).
-				// Re-using it here keeps re-spawn linkage (parentAgent + claudeSessionId)
-				// resolved from the same row.
-				const priorClaudeSessionId = existingSession?.claudeSessionId ?? null;
-
-				// Preflight the FIRST dispatch. The same per-spawn readiness check the
-				// turn-runner runs before every later turn (runtime.preflightDirectSpawn)
-				// is delegated here for the initial spawn, so both paths share one source
-				// of truth. For sapling-with-subscription-proxy this health-checks the local
-				// bearer proxy (auto-starting it when down) and throws when it is squatted,
-				// token-less, or unreachable — hard-failing the dispatch rather than letting
-				// the worker spawn against a dead/misconfigured proxy (which would 401
-				// mid-task). Idempotent + cheap: the turn-runner re-running it is a no-op
-				// localhost GET when already healthy. Runtimes without the method are no-ops.
-				if (runtime.preflightDirectSpawn) {
-					try {
-						await runtime.preflightDirectSpawn();
-					} catch (err) {
-						throw new AgentError(err instanceof Error ? err.message : String(err), {
-							agentName: name,
-						});
-					}
-				}
-
-				// Build the initial prompt (mulch expertise + pending mail + beacon)
-				// as the first user turn.
-				const pendingMailStore = createMailStore(join(overstoryDir, "mail.db"));
-				let initialPrompt: string;
-				try {
-					const pendingMailClient = createMailClient(pendingMailStore);
-					const pendingMessages = pendingMailClient.check(name);
-					const mailSection = formatMailSection(pendingMessages);
-					const beacon = buildBeacon({
-						agentName: name,
-						capability,
-						taskId,
-						parentAgent,
-						depth,
-						instructionPath: runtime.instructionPath,
-					});
-					initialPrompt = buildInitialHeadlessPrompt(
-						mulchExpertise,
-						mailSection || undefined,
-						beacon,
-						specContent,
-					);
-				} finally {
-					pendingMailStore.close();
-				}
-
-				// 13. Record session BEFORE runTurn so the runner reads it under its
-				// lock. pid is null — there is no persistent process; the runner
-				// publishes a per-turn PID via .overstory/agents/<name>/turn.pid for
-				// the duration of each turn. Carry priorClaudeSessionId (mx-5c5ae6).
-				const session: AgentSession = {
-					id: `session-${Date.now()}-${name}`,
+				// "booting", then drives the first user turn synchronously. No
+				// persistent process remains after this returns; subsequent turns
+				// are driven by `ov serve` (mail) or `ov nudge`.
+				// `existingSession` was captured during the name-collision check
+				// (above) and passed through so re-spawn linkage (claudeSessionId)
+				// resolves from the same row. Delegates to `spawnHeadlessSession`
+				// (src/agents/headless-session.ts) — preflight, initial-prompt
+				// build, session upsert, and the first `runTurn` all live there now
+				// so a future headless run-to-completion driver can call the same
+				// service directly (ov-drive-completion Phase 1).
+				const { firstTurn: turnResult } = await spawnHeadlessSession({
 					agentName: name,
 					capability,
-					worktreePath,
-					branchName,
-					taskId: taskId,
-					tmuxSession: "",
-					state: "booting",
-					pid: null,
-					parentAgent: parentAgent,
-					depth,
-					runId,
-					startedAt: new Date().toISOString(),
-					lastActivity: new Date().toISOString(),
-					escalationLevel: 0,
-					stalledSince: null,
-					transcriptPath: null,
-					...(priorClaudeSessionId !== null ? { claudeSessionId: priorClaudeSessionId } : {}),
-				};
-				store.upsert(session);
-
-				// Drive the first user turn synchronously. runTurn manages spawn,
-				// stdin write+EOF, event drain, session_id capture, terminal-mail
-				// detection, and state transition.
-				const turnResult = await runTurn({
-					agentName: name,
-					capability,
+					taskId,
 					overstoryDir,
 					worktreePath,
 					projectRoot: config.project.root,
-					taskId,
-					userTurnNdjson: initialPrompt,
+					branchName,
+					parentAgent,
+					depth,
 					runtime,
 					resolvedModel,
 					runId,
-					mailDbPath: join(overstoryDir, "mail.db"),
-					eventsDbPath: join(overstoryDir, "events.db"),
-					sessionsDbPath: join(overstoryDir, "sessions.db"),
+					store,
+					existingSession,
+					mulchExpertise,
+					specContent,
 				});
 
 				// 14. Output result (headless)

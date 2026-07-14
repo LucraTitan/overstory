@@ -8,6 +8,7 @@ import type { MailMessage } from "../types.ts";
 import {
 	_runPersistentMailTick,
 	_runTurnRunnerTick,
+	dispatchUnreadOnce,
 	formatMailBatch,
 	startPersistentMailLoop,
 	startTurnRunnerMailLoop,
@@ -134,7 +135,7 @@ describe("startTurnRunnerMailLoop", () => {
 	test("invokes runTurn with batched user turn and marks messages read on success", async () => {
 		const store = createMailStore(mailDbPath);
 		const client = createMailClient(store);
-		client.send({
+		const idA = client.send({
 			from: "lead",
 			to: "build-agent",
 			subject: "Task A",
@@ -142,7 +143,7 @@ describe("startTurnRunnerMailLoop", () => {
 			type: "dispatch",
 			priority: "normal",
 		});
-		client.send({
+		const idB = client.send({
 			from: "lead",
 			to: "build-agent",
 			subject: "Task B",
@@ -168,6 +169,14 @@ describe("startTurnRunnerMailLoop", () => {
 		const text: string = parsed.message.content[0].text;
 		expect(text).toContain("Task A");
 		expect(text).toContain("Task B");
+
+		// A delivered tick must carry the claimed batch's message ids —
+		// callers correlate a dispatch back to the mail it delivered
+		// (overstory ov-drive-completion Phase 1 Codex-fix: this used to be
+		// hardcoded to `[]` after the dispatchUnreadOnce extraction).
+		if (result.kind === "delivered") {
+			expect(result.messageIds).toEqual([idA, idB]);
+		}
 
 		const checkStore = createMailStore(mailDbPath);
 		try {
@@ -209,7 +218,7 @@ describe("startTurnRunnerMailLoop", () => {
 	test("does not mark messages read when runTurn throws", async () => {
 		const store = createMailStore(mailDbPath);
 		const client = createMailClient(store);
-		client.send({
+		const throwId = client.send({
 			from: "lead",
 			to: "throw-agent",
 			subject: "Boom",
@@ -230,6 +239,12 @@ describe("startTurnRunnerMailLoop", () => {
 		expect(result.kind).toBe("error");
 		if (result.kind === "error") {
 			expect(result.error).toBeInstanceOf(Error);
+			// An errored tick must still carry the claimed batch's message ids
+			// so a failed dispatch can be correlated back to the mail that
+			// triggered it (overstory ov-drive-completion Phase 1 Codex-fix:
+			// this used to be hardcoded to `[]` after the dispatchUnreadOnce
+			// extraction, losing failed-batch correlation).
+			expect(result.messageIds).toEqual([throwId]);
 		}
 
 		const checkStore = createMailStore(mailDbPath);
@@ -446,6 +461,181 @@ describe("startTurnRunnerMailLoop", () => {
 		// only message already marked read). Allow ≤2 to keep the assertion
 		// resilient to scheduler timing on slower CI runners.
 		expect(calls).toBeLessThanOrEqual(2);
+	});
+});
+
+describe("dispatchUnreadOnce", () => {
+	let tempDir: string;
+	let mailDbPath: string;
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "overstory-dispatch-once-test-"));
+		mailDbPath = join(tempDir, "mail.db");
+	});
+
+	afterEach(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	function makeRunTurnStub(result: Partial<TurnResult> = {}): {
+		runTurn: (opts: RunTurnOpts) => Promise<TurnResult>;
+		calls: RunTurnOpts[];
+	} {
+		const calls: RunTurnOpts[] = [];
+		const filled: TurnResult = {
+			exitCode: 0,
+			cleanResult: true,
+			newSessionId: null,
+			resumeMismatch: false,
+			terminalMailObserved: false,
+			durationMs: 1,
+			initialState: "booting",
+			finalState: "working",
+			stallAborted: false,
+			terminalMailMissing: false,
+			...result,
+		};
+		return {
+			calls,
+			runTurn: async (opts) => {
+				calls.push(opts);
+				return filled;
+			},
+		};
+	}
+
+	function fakeOptsFactory(agentName: string): TurnRunnerOptsFactory {
+		return (userTurnNdjson: string): RunTurnOpts =>
+			({
+				agentName,
+				capability: "builder",
+				overstoryDir: tempDir,
+				worktreePath: tempDir,
+				projectRoot: tempDir,
+				taskId: "task-x",
+				userTurnNdjson,
+				runtime: { id: "claude" } as unknown as RunTurnOpts["runtime"],
+				resolvedModel: { model: "test", isExplicitOverride: false },
+				runId: null,
+				mailDbPath,
+				eventsDbPath: join(tempDir, "events.db"),
+				sessionsDbPath: join(tempDir, "sessions.db"),
+			}) satisfies RunTurnOpts;
+	}
+
+	test("resolves { drove: false } and never invokes runTurnFn when there is no unread mail", async () => {
+		const stub = makeRunTurnStub();
+
+		const outcome = await dispatchUnreadOnce({
+			agentName: "empty-agent",
+			optsFactory: fakeOptsFactory("empty-agent"),
+			runTurnFn: stub.runTurn,
+			mailStorePath: mailDbPath,
+		});
+
+		expect(outcome.drove).toBe(false);
+		expect(outcome.turnResult).toBeUndefined();
+		expect(stub.calls.length).toBe(0);
+	});
+
+	test("drives one turn and marks mail read when runTurnFn exits 0", async () => {
+		const store = createMailStore(mailDbPath);
+		const client = createMailClient(store);
+		const messageId = client.send({
+			from: "lead",
+			to: "dispatch-agent",
+			subject: "Task A",
+			body: "Work on A.",
+			type: "dispatch",
+			priority: "normal",
+		});
+		store.close();
+
+		const stub = makeRunTurnStub({ exitCode: 0 });
+		const outcome = await dispatchUnreadOnce({
+			agentName: "dispatch-agent",
+			optsFactory: fakeOptsFactory("dispatch-agent"),
+			runTurnFn: stub.runTurn,
+			mailStorePath: mailDbPath,
+		});
+
+		expect(outcome.drove).toBe(true);
+		expect(outcome.turnResult?.exitCode).toBe(0);
+		expect(outcome.messageIds).toEqual([messageId]);
+		expect(stub.calls.length).toBe(1);
+
+		const checkStore = createMailStore(mailDbPath);
+		try {
+			expect(checkStore.getUnread("dispatch-agent").length).toBe(0);
+		} finally {
+			checkStore.close();
+		}
+	});
+
+	test("leaves mail unread when runTurnFn exits non-zero", async () => {
+		const store = createMailStore(mailDbPath);
+		const client = createMailClient(store);
+		client.send({
+			from: "lead",
+			to: "fail-agent",
+			subject: "Try again",
+			body: "Should not be marked read.",
+			type: "dispatch",
+			priority: "normal",
+		});
+		store.close();
+
+		const stub = makeRunTurnStub({ exitCode: 1, cleanResult: false });
+		const outcome = await dispatchUnreadOnce({
+			agentName: "fail-agent",
+			optsFactory: fakeOptsFactory("fail-agent"),
+			runTurnFn: stub.runTurn,
+			mailStorePath: mailDbPath,
+		});
+
+		expect(outcome.drove).toBe(true);
+		expect(outcome.turnResult?.exitCode).toBe(1);
+
+		const checkStore = createMailStore(mailDbPath);
+		try {
+			expect(checkStore.getUnread("fail-agent").length).toBe(1);
+		} finally {
+			checkStore.close();
+		}
+	});
+
+	test("propagates a thrown error from runTurnFn uncaught, leaving mail unread", async () => {
+		const store = createMailStore(mailDbPath);
+		const client = createMailClient(store);
+		client.send({
+			from: "lead",
+			to: "throw-agent",
+			subject: "Boom",
+			body: "Throw inside runTurn.",
+			type: "dispatch",
+			priority: "normal",
+		});
+		store.close();
+
+		const rejecting = async (): Promise<TurnResult> => {
+			throw new Error("simulated spawn failure");
+		};
+
+		await expect(
+			dispatchUnreadOnce({
+				agentName: "throw-agent",
+				optsFactory: fakeOptsFactory("throw-agent"),
+				runTurnFn: rejecting,
+				mailStorePath: mailDbPath,
+			}),
+		).rejects.toThrow("simulated spawn failure");
+
+		const checkStore = createMailStore(mailDbPath);
+		try {
+			expect(checkStore.getUnread("throw-agent").length).toBe(1);
+		} finally {
+			checkStore.close();
+		}
 	});
 });
 
