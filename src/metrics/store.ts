@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   estimated_cost_usd REAL,
   model_used TEXT,
   run_id TEXT,
-  PRIMARY KEY (agent_name, task_id)
+  PRIMARY KEY (agent_name, task_id, run_id)
 )`;
 
 const CREATE_SNAPSHOTS_TABLE = `
@@ -166,6 +166,93 @@ function migrateTokenColumns(db: Database): void {
 	}
 }
 
+/**
+ * Widen the `sessions` table's uniqueness key from `(agent_name, task_id)` to
+ * `(agent_name, task_id, run_id)` (HIGH-6 fix).
+ *
+ * Agent names are deterministic per task (`generateAgentName`), so a second
+ * `ov drive` run of the SAME seed reuses the SAME `(agent_name, task_id)`
+ * pair. With the old two-column PRIMARY KEY, `recordSession`'s
+ * `INSERT OR REPLACE` silently overwrote the first run's metrics row with
+ * the second run's — the first run's cost/token/duration data was lost with
+ * no error. Widening the key to include `run_id` lets every run keep its own
+ * row.
+ *
+ * SQLite can't `ALTER TABLE ... ADD/DROP PRIMARY KEY` in place, so this
+ * rebuilds the table (create-copy-drop-rename) inside one transaction. Safe
+ * to call multiple times — a no-op once the target 3-column PK is already in
+ * place (checked via `PRAGMA table_info`, not a sentinel row, so it also
+ * correctly no-ops against a brand-new DB created directly with the new
+ * `CREATE_TABLE` DDL above).
+ *
+ * NOTE (finding C, fixed — was a documented-but-incorrect limitation): SQLite
+ * treats NULL as distinct from NULL for uniqueness purposes, so `INSERT OR
+ * REPLACE` alone does NOT dedup rows with a NULL `run_id` against each other
+ * post-migration. This was previously accepted here as a "narrow legacy"
+ * trade-off on the assumption that every production caller always populates a
+ * real run id — that assumption was wrong: `src/commands/log.ts`'s
+ * `--finalize` path calls `recordSession` with a nullable
+ * `agentSession.runId`, making this a genuine regression (two identical
+ * NULL-run_id writes for the same agent/task now silently accumulate
+ * duplicate rows instead of replacing, as they did before the PK was
+ * widened). `recordSession` below now explicitly deletes any prior
+ * NULL-run_id row for the same `(agent_name, task_id)` before inserting when
+ * `run_id` is null, restoring the original REPLACE-on-NULL semantics without
+ * regressing the HIGH-6 per-run-id behavior for non-null run ids.
+ */
+function migrateCompositeKeyWithRunId(db: Database): void {
+	const rows = db.prepare("PRAGMA table_info(sessions)").all() as Array<{
+		name: string;
+		pk: number;
+	}>;
+	const pkColumns = rows
+		.filter((r) => r.pk > 0)
+		.sort((a, b) => a.pk - b.pk)
+		.map((r) => r.name);
+	const alreadyMigrated =
+		pkColumns.length === 3 &&
+		pkColumns[0] === "agent_name" &&
+		pkColumns[1] === "task_id" &&
+		pkColumns[2] === "run_id";
+	if (alreadyMigrated) return;
+
+	db.exec("BEGIN IMMEDIATE");
+	try {
+		db.exec(`
+CREATE TABLE sessions_migrating (
+  agent_name TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  capability TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  completed_at TEXT,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  exit_code INTEGER,
+  merge_result TEXT,
+  parent_agent TEXT,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+  estimated_cost_usd REAL,
+  model_used TEXT,
+  run_id TEXT,
+  PRIMARY KEY (agent_name, task_id, run_id)
+)`);
+		db.exec(`
+INSERT INTO sessions_migrating
+  (agent_name, task_id, capability, started_at, completed_at, duration_ms, exit_code, merge_result, parent_agent, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, estimated_cost_usd, model_used, run_id)
+SELECT
+  agent_name, task_id, capability, started_at, completed_at, duration_ms, exit_code, merge_result, parent_agent, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, estimated_cost_usd, model_used, run_id
+FROM sessions`);
+		db.exec("DROP TABLE sessions");
+		db.exec("ALTER TABLE sessions_migrating RENAME TO sessions");
+		db.exec("COMMIT");
+	} catch (err) {
+		db.exec("ROLLBACK");
+		throw err;
+	}
+}
+
 /** Convert a database row (snake_case) to a SessionMetrics object (camelCase). */
 function rowToMetrics(row: SessionRow): SessionMetrics {
 	return {
@@ -227,6 +314,9 @@ export function createMetricsStore(dbPath: string): MetricsStore {
 	migrateTokenColumns(db);
 	migrateRunIdColumn(db);
 	migrateSnapshotRunIdColumn(db);
+	// Must run AFTER migrateRunIdColumn — it copies the run_id column into the
+	// rebuilt table's widened PRIMARY KEY, so the column must already exist.
+	migrateCompositeKeyWithRunId(db);
 
 	// Prepare statements for all queries
 	const insertStmt = db.prepare<
@@ -254,6 +344,15 @@ export function createMetricsStore(dbPath: string): MetricsStore {
 			(agent_name, task_id, capability, started_at, completed_at, duration_ms, exit_code, merge_result, parent_agent, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, estimated_cost_usd, model_used, run_id)
 		VALUES
 			($agent_name, $task_id, $capability, $started_at, $completed_at, $duration_ms, $exit_code, $merge_result, $parent_agent, $input_tokens, $output_tokens, $cache_read_tokens, $cache_creation_tokens, $estimated_cost_usd, $model_used, $run_id)
+	`);
+
+	// finding C: NULL run_id rows are not deduped by the widened PK's own
+	// uniqueness (SQLite: NULL <> NULL). Explicitly clear any prior
+	// NULL-run_id row for this (agent, task) pair before such an insert so
+	// repeated null-run-id writes still replace rather than accumulate.
+	const deleteNullRunIdStmt = db.prepare<void, { $agent_name: string; $task_id: string }>(`
+		DELETE FROM sessions
+		WHERE agent_name = $agent_name AND task_id = $task_id AND run_id IS NULL
 	`);
 
 	const recentStmt = db.prepare<SessionRow, { $limit: number }>(`
@@ -342,7 +441,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
 
 	return {
 		recordSession(metrics: SessionMetrics): void {
-			insertStmt.run({
+			const params = {
 				$agent_name: metrics.agentName,
 				$task_id: metrics.taskId,
 				$capability: metrics.capability,
@@ -359,7 +458,37 @@ export function createMetricsStore(dbPath: string): MetricsStore {
 				$estimated_cost_usd: metrics.estimatedCostUsd,
 				$model_used: metrics.modelUsed,
 				$run_id: metrics.runId,
-			});
+			};
+
+			if (metrics.runId === null) {
+				// finding C / finding 3: restore prior REPLACE-on-NULL-run_id dedup
+				// semantics (see deleteNullRunIdStmt's comment above) -- and do so
+				// ATOMICALLY. A plain sequential DELETE-then-INSERT (as originally
+				// fixed for finding C) is two round trips on this connection with no
+				// lock held between them: a second writer's DELETE could interleave
+				// between this DELETE and this INSERT, and both writers' INSERTs
+				// would then land as two separate (agent_name, task_id, NULL) rows
+				// instead of one. `BEGIN IMMEDIATE` acquires SQLite's write lock
+				// up front (before either statement runs), so any concurrent
+				// connection attempting its own NULL-run_id delete+insert blocks
+				// (retrying under `busy_timeout`) until this transaction commits —
+				// the two statements execute as one indivisible unit across
+				// processes, not just within this connection.
+				db.exec("BEGIN IMMEDIATE");
+				try {
+					deleteNullRunIdStmt.run({
+						$agent_name: metrics.agentName,
+						$task_id: metrics.taskId,
+					});
+					insertStmt.run(params);
+					db.exec("COMMIT");
+				} catch (err) {
+					db.exec("ROLLBACK");
+					throw err;
+				}
+				return;
+			}
+			insertStmt.run(params);
 		},
 
 		getRecentSessions(limit = 20): SessionMetrics[] {

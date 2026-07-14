@@ -63,9 +63,12 @@ describe("recordSession", () => {
 		expect(retrieved[0]).toEqual(session);
 	});
 
-	test("INSERT OR REPLACE: same (agent_name, task_id) key overwrites previous row", () => {
-		const session1 = makeSession({ durationMs: 100_000 });
-		const session2 = makeSession({ durationMs: 200_000 });
+	test("INSERT OR REPLACE: same (agent_name, task_id, run_id) key overwrites previous row", () => {
+		// run_id must match too (HIGH-6: the PK was widened to include it) —
+		// this reflects the real production shape, where every recordSession
+		// call from `ov drive`/`ov log --finalize` always populates a run id.
+		const session1 = makeSession({ durationMs: 100_000, runId: "run-1" });
+		const session2 = makeSession({ durationMs: 200_000, runId: "run-1" });
 
 		store.recordSession(session1);
 		store.recordSession(session2);
@@ -73,6 +76,163 @@ describe("recordSession", () => {
 		const retrieved = store.getRecentSessions(10);
 		expect(retrieved).toHaveLength(1);
 		expect(retrieved[0]?.durationMs).toBe(200_000);
+	});
+
+	test("HIGH-6: two runs of the same agent+task keep independent metrics rows (no cross-run clobber)", () => {
+		// Same agent_name + task_id (deterministic per seed — rerunning the same
+		// seed reuses both), but a DIFFERENT run_id. Before the fix this
+		// overwrote the first run's row via INSERT OR REPLACE on a 2-column PK.
+		const runOne = makeSession({ durationMs: 100_000, runId: "run-1" });
+		const runTwo = makeSession({ durationMs: 200_000, runId: "run-2" });
+
+		store.recordSession(runOne);
+		store.recordSession(runTwo);
+
+		const retrieved = store.getRecentSessions(10);
+		expect(retrieved).toHaveLength(2);
+		const byRun = new Map(retrieved.map((r) => [r.runId, r.durationMs]));
+		expect(byRun.get("run-1")).toBe(100_000);
+		expect(byRun.get("run-2")).toBe(200_000);
+
+		expect(store.getSessionsByRun("run-1")).toHaveLength(1);
+		expect(store.getSessionsByRun("run-2")).toHaveLength(1);
+	});
+
+	test("finding C: two NULL-run_id writes for the same (agent, task) replace, not accumulate", () => {
+		// SQLite treats NULL as distinct from NULL for uniqueness purposes, so
+		// the widened (agent_name, task_id, run_id) PK's own INSERT OR REPLACE
+		// conflict path never fires for two NULL-run_id rows -- recordSession
+		// must explicitly dedup this case itself (src/commands/log.ts's
+		// --finalize path is a real production caller that can pass a nullable
+		// runId).
+		const first = makeSession({ durationMs: 100_000, runId: null });
+		const second = makeSession({ durationMs: 200_000, runId: null });
+
+		store.recordSession(first);
+		store.recordSession(second);
+
+		const retrieved = store.getRecentSessions(10);
+		expect(retrieved).toHaveLength(1);
+		expect(retrieved[0]?.durationMs).toBe(200_000);
+		expect(retrieved[0]?.runId).toBeNull();
+	});
+
+	test("finding C: NULL-run_id dedup does not cross-contaminate a DIFFERENT (agent, task) pair", () => {
+		const taskA = makeSession({ agentName: "agent-a", taskId: "task-a", runId: null });
+		const taskB = makeSession({ agentName: "agent-b", taskId: "task-b", runId: null });
+
+		store.recordSession(taskA);
+		store.recordSession(taskB);
+
+		const retrieved = store.getRecentSessions(10);
+		expect(retrieved).toHaveLength(2);
+	});
+
+	test("finding C: two DIFFERENT non-null run ids for the same (agent, task) still stay independent (no regression of HIGH-6)", () => {
+		const runOne = makeSession({ durationMs: 100_000, runId: "run-c1" });
+		const runTwo = makeSession({ durationMs: 200_000, runId: "run-c2" });
+
+		store.recordSession(runOne);
+		store.recordSession(runTwo);
+
+		const retrieved = store.getRecentSessions(10);
+		expect(retrieved).toHaveLength(2);
+	});
+
+	test("finding 3: concurrent NULL-run_id writes from separate OS processes never leave duplicate rows (atomic delete+insert)", async () => {
+		// Pre-fix, recordSession's NULL-run_id dedup ran as two separate,
+		// individually auto-committed statements (DELETE, then INSERT) with
+		// no lock held across the pair. Two real processes writing the SAME
+		// (agent_name, task_id, NULL) key at once could interleave --
+		// process A's DELETE, then process B's DELETE (no-op) and INSERT,
+		// then process A's INSERT -- leaving TWO rows for one logical key.
+		// Post-fix, `BEGIN IMMEDIATE` makes the delete+insert pair one
+		// indivisible unit, serializing concurrent writers via SQLite's own
+		// write lock (busy_timeout retries) instead of racing.
+		//
+		// This spawns real `bun` subprocesses (not just concurrent async
+		// calls within this one process) so the writers genuinely contend
+		// for the SQLite file lock, not just JS's single-threaded scheduler.
+		const storeModulePath = new URL("./store.ts", import.meta.url).pathname;
+		const agentName = "concurrent-null-agent";
+		const taskId = "concurrent-null-task";
+
+		const spawnWriter = (durationMs: number) => {
+			const script = `
+					const { createMetricsStore } = await import(${JSON.stringify(storeModulePath)});
+					const store = createMetricsStore(${JSON.stringify(dbPath)});
+					store.recordSession({
+						agentName: ${JSON.stringify(agentName)},
+						taskId: ${JSON.stringify(taskId)},
+						capability: "builder",
+						startedAt: new Date().toISOString(),
+						completedAt: new Date().toISOString(),
+						durationMs: ${durationMs},
+						exitCode: 0,
+						mergeResult: null,
+						parentAgent: null,
+						inputTokens: 0,
+						outputTokens: 0,
+						cacheReadTokens: 0,
+						cacheCreationTokens: 0,
+						estimatedCostUsd: null,
+						modelUsed: null,
+						runId: null,
+					});
+					store.close();
+				`;
+			return Bun.spawn(["bun", "-e", script], {
+				stdout: "pipe",
+				stderr: "pipe",
+			}).exited;
+		};
+
+		const durations = Array.from({ length: 12 }, (_, i) => 1000 + i);
+		const exitCodes = await Promise.all(durations.map((d) => spawnWriter(d)));
+		expect(exitCodes.every((code) => code === 0)).toBe(true);
+
+		const verifyStore = createMetricsStore(dbPath);
+		try {
+			const rows = verifyStore
+				.getSessionsByAgent(agentName)
+				.filter((s) => s.taskId === taskId && s.runId === null);
+			expect(rows).toHaveLength(1);
+		} finally {
+			verifyStore.close();
+		}
+	}, 20_000);
+
+	test("finding 3: the NULL-run_id delete+insert is one atomic unit -- an insert failure rolls the delete back too", () => {
+		// This is the deterministic proof of atomicity (the subprocess test
+		// above is the "concurrent-style" real-world exercise; this test proves
+		// the actual mechanism without depending on OS scheduling luck). If
+		// delete-then-insert were still two independent statements (the
+		// pre-fix shape), a failed insert would leave the row deleted with
+		// nothing to replace it -- silent data loss. With the fix, both run
+		// inside one transaction, so a failed insert rolls the delete back too
+		// and the original row survives untouched.
+		const original = makeSession({
+			agentName: "atomic-agent",
+			taskId: "atomic-task",
+			runId: null,
+			durationMs: 111,
+		});
+		store.recordSession(original);
+
+		const invalid = makeSession({
+			agentName: "atomic-agent",
+			taskId: "atomic-task",
+			runId: null,
+			durationMs: 222,
+			// `started_at` is NOT NULL in the schema; forcing a constraint
+			// violation on the INSERT half of the transaction.
+			startedAt: null as unknown as string,
+		});
+		expect(() => store.recordSession(invalid)).toThrow();
+
+		const rows = store.getSessionsByAgent("atomic-agent");
+		expect(rows).toHaveLength(1);
+		expect(rows[0]?.durationMs).toBe(111);
 	});
 
 	test("all fields roundtrip correctly (camelCase TS → snake_case SQLite → camelCase TS)", () => {

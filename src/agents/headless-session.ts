@@ -73,6 +73,14 @@ export interface SpawnHeadlessSessionOpts {
 	 * tested deterministically without spawning a real claude process.
 	 */
 	_spawnFn?: TurnSpawnFn;
+	/**
+	 * Forwarded verbatim to `runTurn`'s `abortSignal` (HIGH-2). `ov drive`
+	 * arms one `AbortController` tied to its wall-clock deadline and threads
+	 * it through every turn it spawns directly, so an in-flight turn is
+	 * killed promptly at the deadline instead of running until the turn
+	 * runner's own (much longer) stall watchdog fires.
+	 */
+	abortSignal?: AbortSignal;
 }
 
 /** Result of {@link spawnHeadlessSession}. */
@@ -114,6 +122,7 @@ export async function spawnHeadlessSession(
 		mulchExpertise,
 		specContent,
 		_spawnFn,
+		abortSignal,
 	} = opts;
 
 	// Preflight the FIRST dispatch. The same per-spawn readiness check the
@@ -205,6 +214,7 @@ export async function spawnHeadlessSession(
 		eventsDbPath: join(overstoryDir, "events.db"),
 		sessionsDbPath: join(overstoryDir, "sessions.db"),
 		...(_spawnFn !== undefined ? { _spawnFn } : {}),
+		...(abortSignal !== undefined ? { abortSignal } : {}),
 	});
 
 	return { agentName, branchName, worktreePath, runId, firstTurn };
