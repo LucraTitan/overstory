@@ -89,6 +89,18 @@ export interface SpawnDriveAgentParams {
 	 * the deadline.
 	 */
 	abortSignal?: AbortSignal;
+	/**
+	 * Forwarded to `spawnHeadlessSession`, which folds it into the agent's
+	 * initial turn as an "AUTHORITATIVE" task-specification section (see
+	 * `buildInitialHeadlessPrompt`). `ov drive` uses this to give the reviewer
+	 * a review-specific initial prompt (reviewing already-committed work,
+	 * send the verdict mail unconditionally) instead of the generic seed
+	 * dispatch brief, since the reviewer's overlay/agent-def prose alone
+	 * ("send worker_done to your parent") is not authoritative enough to
+	 * override a reviewer's own judgment that a terminated parent makes
+	 * sending pointless.
+	 */
+	specContent?: string;
 }
 
 /** Result of a successful {@link spawnDriveAgent} call. */
@@ -128,6 +140,7 @@ export async function spawnDriveAgent(
 		slingerName,
 		skipTaskCheck,
 		abortSignal,
+		specContent,
 	} = params;
 
 	if (depth > config.agents.maxDepth) {
@@ -317,6 +330,7 @@ export async function spawnDriveAgent(
 			existingSession,
 			_spawnFn: params._spawnFn,
 			...(abortSignal !== undefined ? { abortSignal } : {}),
+			...(specContent !== undefined ? { specContent } : {}),
 		});
 
 		return { agentName, branchName, worktreePath, firstTurn };

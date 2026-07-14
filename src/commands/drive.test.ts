@@ -465,6 +465,98 @@ describe("driveCommand", () => {
 		expect(closedIds).toContain("seed-result-type");
 	});
 
+	test("live-spike fix: reviewer's initial turn carries a review-specific AUTHORITATIVE prompt (not just the seed dispatch brief), so a persisted PASS verdict from a reviewer whose parent (the builder) is already 'completed' by review time still reaches 'merged'", async () => {
+		// Root cause (confirmed via a live sandbox spike): the reviewer is
+		// spawned with `parentAgent: topAgentName`, and the top/builder session
+		// is already `completed` by the time the reviewer's first turn runs (a
+		// spawn-per-turn agent's session terminalizes as soon as its own last
+		// turn resolves cleanly). A real reviewer LLM, seeing its parent
+		// terminated, reasoned its `worker_done` mail would "bounce" and gave up
+		// without sending -- so `drive.ts`'s `from=reviewerName` verdict lookup
+		// found nothing and the run failed, even though the review itself
+		// reached PASS. The fix gives the reviewer an explicit, unconditional
+		// "send regardless of any agent's liveness" instruction via
+		// `specContent` (threaded through `spawnDriveAgent` ->
+		// `spawnHeadlessSession` -> `buildInitialHeadlessPrompt`'s
+		// "AUTHORITATIVE" section), superseding the reviewer agent-def's own
+		// advisory "send to parent" prose.
+		const overstoryDir = join(tempDir, ".overstory");
+		const { tracker, closedIds } = makeFakeTracker();
+		const topAgentName = "builder-seed-reviewer-prompt";
+
+		let capturedReviewerStdin = "";
+		let topStateAtReviewSpawn: string | undefined;
+		let reviewerSpawnCount = 0;
+
+		const _spawnFn: TurnSpawnFn = (_cmd, spawnOpts) => {
+			const agentName = spawnOpts.env.OVERSTORY_AGENT_NAME ?? "unknown";
+			const worktreePath = spawnOpts.cwd;
+			const fake = makeFakeProc();
+			const sessionId = `sess-${agentName}`;
+
+			if (agentName.startsWith("reviewer-")) {
+				reviewerSpawnCount += 1;
+
+				// Confirm the live-spike scenario: the top/builder session is
+				// already terminated ("completed") by the moment the reviewer's
+				// first turn is dispatched.
+				const { store } = openSessionStore(overstoryDir);
+				try {
+					topStateAtReviewSpawn = store.getByName(topAgentName)?.state;
+				} finally {
+					store.close();
+				}
+
+				// Capture the exact stream-json envelope `runTurn` writes to this
+				// reviewer's stdin for its first turn -- this IS the reviewer's
+				// initial prompt (`userTurnNdjson`, built from `specContent` +
+				// the auto-dispatch mail + the beacon).
+				fake.stdin.write = (data: string | Uint8Array): number => {
+					capturedReviewerStdin += typeof data === "string" ? data : new TextDecoder().decode(data);
+					return 0;
+				};
+
+				sendTerminalMailSync(overstoryDir, agentName, "Worker done: review — PASS", "worker_done");
+				emitFakeTurn(fake, { sessionId });
+				fake._exit(0);
+				return fake;
+			}
+
+			// Top ("builder") agent: commit + send terminal mail, exactly like
+			// `makeFakeSpawn`'s default builder branch.
+			commitFileChangeSync(worktreePath, agentName);
+			sendTerminalMailSync(overstoryDir, agentName, `Worker done: ${agentName}`);
+			emitFakeTurn(fake, { sessionId });
+			fake._exit(0);
+			return fake;
+		};
+
+		const result = await driveCommand(
+			"seed-reviewer-prompt",
+			{ capability: "builder" },
+			{ _spawnFn, tracker },
+		);
+
+		expect(reviewerSpawnCount).toBe(1);
+		expect(topStateAtReviewSpawn).toBe("completed");
+
+		// The reviewer's own persisted PASS verdict was captured and the run
+		// reached 'merged' -- not 'failed' the way a dropped/unsent verdict
+		// mail would have produced pre-fix.
+		expect(result.outcome).toBe("merged");
+		expect(result.mergedBranch).toBeTruthy();
+		expect(closedIds).toContain("seed-reviewer-prompt");
+
+		// The reviewer's initial prompt carries the NEW review-specific
+		// AUTHORITATIVE section -- proof this is a review-specific brief, not
+		// just the generic seed/dispatch mail + beacon a reviewer got pre-fix.
+		expect(capturedReviewerStdin).toContain(
+			"## Task Specification (AUTHORITATIVE — follow exactly; deviations are bugs)",
+		);
+		expect(capturedReviewerStdin).toContain("You are REVIEWING already-completed work");
+		expect(capturedReviewerStdin).toContain("SEND THIS MAIL UNCONDITIONALLY");
+	});
+
 	test("review FAIL -> outcome 'review_failed', nothing merged, seed left open", async () => {
 		const overstoryDir = join(tempDir, ".overstory");
 		const { tracker, closedIds } = makeFakeTracker();

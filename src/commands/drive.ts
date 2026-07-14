@@ -205,6 +205,55 @@ async function getBranchHeadSha(repoRoot: string, branchName: string): Promise<s
 }
 
 /**
+ * Mail recipient label the reviewer's review-specific prompt (below)
+ * instructs it to use for its verdict mail. Deliberately NOT a real
+ * agent/session name: `ov drive` reads the reviewer's verdict by SENDER
+ * (`from=<reviewer agent name>`), never by recipient, and `client.send`
+ * persists unconditionally regardless of whether the recipient is a live
+ * session (`src/mail/client.ts`'s `send()` is a plain, unconditional
+ * `store.insert`, no liveness/format check on `to`) -- so any stable label
+ * works. A fixed label -- rather than the reviewer's actual `parentAgent`,
+ * which is the builder and is already `completed` by review time -- avoids
+ * relying on the reviewer LLM to send to a target it can observe is
+ * terminated, which is exactly the failure mode this fix addresses.
+ */
+const REVIEW_VERDICT_MAIL_RECIPIENT = "ov-drive-supervisor";
+
+/**
+ * Build a review-specific initial-turn prompt for the reviewer agent `ov
+ * drive` spawns during reconcile. Passed as `specContent` (an existing
+ * `spawnHeadlessSession` seam -- see `headless-prompt.ts`'s
+ * `buildInitialHeadlessPrompt`), which surfaces it as an "AUTHORITATIVE"
+ * task-specification section in the reviewer's very first turn, ahead of
+ * the generic auto-dispatch mail and the startup beacon.
+ *
+ * Root cause this addresses (confirmed via a live sandbox spike): the
+ * reviewer's own agent-def prose (`agents/reviewer.md`) only tells it to
+ * "send worker_done to your parent" -- advisory text a reviewer LLM can (and
+ * did) decide not to follow once it observes its parent (spawned as
+ * `parentAgent: topAgentName`, the builder -- already `completed` by review
+ * time) has terminated: it reasoned the mail would "bounce" and gave up
+ * without sending, so the driver's `from=reviewerName` verdict lookup found
+ * nothing and the run failed. This prompt overrides that with an explicit,
+ * unconditional instruction to send regardless of any other agent's
+ * apparent liveness, to a fixed recipient label that never needs to be a
+ * live session (see {@link REVIEW_VERDICT_MAIL_RECIPIENT}).
+ */
+function buildReviewerPrompt(opts: { taskId: string; branchName: string }): string {
+	const { taskId, branchName } = opts;
+	return [
+		`You are REVIEWING already-completed work for task "${taskId}", not building it.`,
+		`The changes are already committed on branch "${branchName}", which is checked out in your worktree right now. There is nothing left to implement -- do not wait for further instructions or for anyone else to respond before proceeding.`,
+		"1. Verify correctness: read the diff against the base branch, read the modified files in full, and run any applicable quality gates.",
+		"2. Reach a PASS or FAIL verdict.",
+		"3. Send your verdict mail as your final action, via:",
+		`   ov mail send --to ${REVIEW_VERDICT_MAIL_RECIPIENT} --subject "Worker done: ${taskId} — PASS" --body "<your findings>" --type worker_done --agent $OVERSTORY_AGENT_NAME`,
+		'   (use "— FAIL" in the subject instead if the review fails -- the PASS/FAIL token must be the last thing on the subject line, exactly as shown).',
+		`SEND THIS MAIL UNCONDITIONALLY -- even if your parent agent, or any other agent in this run, appears completed, terminated, or unreachable. This run tracks your verdict by SENDER, not by recipient liveness: it is captured by matching "from=<your agent name>", never by whether "${REVIEW_VERDICT_MAIL_RECIPIENT}" is a live session. Sending never "bounces" and is never pointless -- it is the ONLY way this run learns your verdict. Do not skip sending, and do not narrate that the recipient is gone instead of sending.`,
+	].join("\n\n");
+}
+
+/**
  * Run the full `ov drive` state machine for one seed task. Never throws for
  * expected-failure paths (spawn failure, breaker trip, review failure,
  * merge-blocked) — those return a structured {@link DriveResult} instead, so
@@ -693,6 +742,10 @@ export async function driveCommand(
 				skipTaskCheck: true,
 				_spawnFn: deps._spawnFn,
 				abortSignal: abortController.signal,
+				specContent: buildReviewerPrompt({
+					taskId: primaryBuilder.taskId,
+					branchName: primaryBuilder.branchName,
+				}),
 			});
 			reviewerName = reviewerSpawn.agentName;
 			trackSessionId(reviewerName, reviewerSpawn.firstTurn.newSessionId);
