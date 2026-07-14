@@ -7,8 +7,8 @@
  */
 
 import { MailError } from "../errors.ts";
-import type { MailMessage, MailMessageType, MailPayloadMap, MailProtocolType } from "../types.ts";
-import type { MailStore } from "./store.ts";
+import type { MailMessage, MailPayloadMap, MailProtocolType } from "../types.ts";
+import type { MailFilters, MailStore } from "./store.ts";
 
 export interface MailClient {
 	/** Send a new message. Returns the assigned message ID. */
@@ -42,12 +42,7 @@ export interface MailClient {
 	checkInject(agentName: string): string;
 
 	/** List messages with optional filters. */
-	list(filters?: {
-		from?: string;
-		to?: string;
-		unread?: boolean;
-		type?: MailMessageType;
-	}): MailMessage[];
+	list(filters?: MailFilters): MailMessage[];
 
 	/** Mark a message as read by ID. Returns whether the message was already read. */
 	markRead(id: string): { alreadyRead: boolean };

@@ -290,7 +290,14 @@ function recordAgentEvent(
 	});
 }
 
-function checkTerminalMailSince(
+/**
+ * Check whether `agentName` has sent a terminal mail (per
+ * {@link terminalMailTypesFor} for `capability`) with `created_at` strictly
+ * after `sinceTs`. Exported so external callers (e.g. a headless
+ * run-to-completion driver) can detect an agent's terminal state without
+ * duplicating this query. Soft signal — any DB error returns `false`.
+ */
+export function checkTerminalMailSince(
 	mailDbPath: string,
 	agentName: string,
 	capability: string,
@@ -371,7 +378,7 @@ function hasScopeExpansionMail(mailDbPath: string, agentName: string): boolean {
  * lands between baseline capture and spawn would have falsely tripped the
  * "terminal mail observed" check (overstory-088b C1).
  */
-function latestTerminalMailTs(
+export function latestTerminalMailTs(
 	mailDbPath: string,
 	agentName: string,
 	capability: string,

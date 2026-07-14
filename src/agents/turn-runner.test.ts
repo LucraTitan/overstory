@@ -13,6 +13,7 @@ import { createSessionStore } from "../sessions/store.ts";
 import type { AgentSession, ResolvedModel } from "../types.ts";
 import { _resetInProcessLocks, readTurnLock } from "./turn-lock.ts";
 import {
+	checkTerminalMailSince,
 	type RunnerLogger,
 	runTurn,
 	type TurnSpawnFn,
@@ -3262,5 +3263,67 @@ describe("runTurn model-pin via alwaysApplyResolvedModel", () => {
 
 		expect(capturedEnvs.length).toBeGreaterThanOrEqual(1);
 		expect(capturedEnvs[0]?.CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING).toBe("1");
+	});
+});
+
+describe("checkTerminalMailSince (exported)", () => {
+	let overstoryDir: string;
+	let mailDbPath: string;
+
+	beforeEach(async () => {
+		overstoryDir = await mkdtemp(join(tmpdir(), "overstory-checkterminal-test-"));
+		mailDbPath = join(overstoryDir, "mail.db");
+	});
+
+	afterEach(async () => {
+		await rm(overstoryDir, { recursive: true, force: true });
+	});
+
+	test("detects a worker_done sent after the baseline timestamp", async () => {
+		const store = createMailStore(mailDbPath);
+		try {
+			const client = createMailClient(store);
+			const baselineTs = new Date(0).toISOString();
+			await Bun.sleep(5);
+
+			client.sendProtocol({
+				from: "wd",
+				to: "lead",
+				subject: "Worker done",
+				body: "done",
+				type: "worker_done",
+				priority: "normal",
+				payload: { taskId: "t1", branch: "b1", exitCode: 0, filesModified: [] },
+			});
+
+			const detected = checkTerminalMailSince(mailDbPath, "wd", "builder", baselineTs);
+			expect(detected).toBe(true);
+		} finally {
+			store.close();
+		}
+	});
+
+	test("ignores a worker_done sent before the baseline timestamp", async () => {
+		const store = createMailStore(mailDbPath);
+		try {
+			const client = createMailClient(store);
+			client.sendProtocol({
+				from: "wd",
+				to: "lead",
+				subject: "Worker done: prior",
+				body: "old",
+				type: "worker_done",
+				priority: "normal",
+				payload: { taskId: "old", branch: "old", exitCode: 0, filesModified: [] },
+			});
+
+			await Bun.sleep(20);
+			const baselineTs = new Date().toISOString();
+
+			const detected = checkTerminalMailSince(mailDbPath, "wd", "builder", baselineTs);
+			expect(detected).toBe(false);
+		} finally {
+			store.close();
+		}
 	});
 });

@@ -81,6 +81,121 @@ export type TurnRunnerTickResult =
 	| { kind: "delivered"; result: TurnResult; messageIds: string[] }
 	| { kind: "error"; error: unknown; messageIds: string[] };
 
+/** Options for {@link dispatchUnreadOnce}. */
+export interface DispatchUnreadOnceOpts {
+	/** Overstory agent name (mail inbox address). */
+	agentName: string;
+	/** Builds the RunTurnOpts from the per-batch user turn payload. */
+	optsFactory: TurnRunnerOptsFactory;
+	/** Function that drives one turn (typically `runTurn` from turn-runner.ts). */
+	runTurnFn: TurnRunnerFn;
+	/** Absolute path to the project's mail.db. */
+	mailStorePath: string;
+}
+
+/** Result of a single {@link dispatchUnreadOnce} call. */
+export interface DispatchUnreadOnceResult {
+	/** Whether a turn was driven — i.e. there was unread mail to dispatch. */
+	drove: boolean;
+	/** The turn's result. Always present when `drove` is `true`. */
+	turnResult?: TurnResult;
+	/**
+	 * IDs of the mail messages claimed for this dispatch. Present (and
+	 * non-empty) whenever `drove` is `true`; omitted when `drove` is `false`
+	 * (no unread mail existed, so nothing was claimed).
+	 */
+	messageIds?: string[];
+}
+
+/**
+ * Non-destructive error-context marker: {@link dispatchUnreadOnce} attaches
+ * the claimed mail message ids to a `runTurnFn` failure before rethrowing it
+ * — same error identity, message, and stack, just enriched — so callers can
+ * recover per-batch correlation from their `catch` block without
+ * `dispatchUnreadOnce` inventing its own error type or callers duplicating
+ * the mail-claim step.
+ */
+interface DispatchUnreadOnceErrorContext {
+	dispatchedMessageIds: string[];
+}
+
+function attachMessageIds<T>(error: T, ids: string[]): T {
+	if (error instanceof Error) {
+		(error as Error & Partial<DispatchUnreadOnceErrorContext>).dispatchedMessageIds = ids;
+	}
+	return error;
+}
+
+/**
+ * Recover message ids attached by {@link attachMessageIds}. Returns `[]` for
+ * any error not produced by `dispatchUnreadOnce` (or with nothing attached),
+ * so callers can use this unconditionally in a generic catch block.
+ */
+function readMessageIds(error: unknown): string[] {
+	if (error instanceof Error) {
+		const ids = (error as Error & Partial<DispatchUnreadOnceErrorContext>).dispatchedMessageIds;
+		if (Array.isArray(ids)) return ids;
+	}
+	return [];
+}
+
+/**
+ * Claim an agent's unread mail and, if any exists, drive exactly one turn
+ * via the injected `runTurnFn`. Messages are marked read only after
+ * `runTurnFn` resolves with `exitCode === 0`; any other exit code leaves
+ * them unread so the next dispatch attempt retries the same batch.
+ *
+ * When there is no unread mail, this resolves to `{ drove: false }` without
+ * invoking `runTurnFn` — the "only drive when unread mail exists" contract
+ * `startTurnRunnerMailLoop` and `ov serve` rely on.
+ *
+ * Errors thrown by `runTurnFn` propagate to the caller with their original
+ * identity, message, and stack unchanged (see `readMessageIds`/
+ * `attachMessageIds` above) — this function only catches transiently to
+ * attach the claimed message ids before rethrowing the SAME error; it does
+ * not swallow or translate failures. The caller still owns translating the
+ * rejection into its own error vocabulary (see `startTurnRunnerMailLoop`'s
+ * `tick()` and `_runTurnRunnerTick` below). This is the single-iteration
+ * code path shared by the production mail loop and, in a later phase, a
+ * headless run-to-completion driver.
+ */
+export async function dispatchUnreadOnce(
+	opts: DispatchUnreadOnceOpts,
+): Promise<DispatchUnreadOnceResult> {
+	const { agentName, optsFactory, runTurnFn, mailStorePath } = opts;
+
+	const store = createMailStore(mailStorePath);
+	let messages: ReturnType<typeof store.getUnread>;
+	try {
+		messages = store.getUnread(agentName);
+	} finally {
+		store.close();
+	}
+	if (messages.length === 0) return { drove: false };
+
+	const userTurnNdjson = encodeUserTurn(formatMailBatch(messages));
+	const ids = messages.map((m) => m.id);
+
+	let turnResult: TurnResult;
+	try {
+		turnResult = await runTurnFn(optsFactory(userTurnNdjson));
+	} catch (error) {
+		throw attachMessageIds(error, ids);
+	}
+
+	// Mark read only on a clean turn — exit code 0. Failed turns leave
+	// messages unread so the next tick retries cleanly.
+	if (turnResult.exitCode === 0) {
+		const markStore = createMailStore(mailStorePath);
+		try {
+			for (const id of ids) markStore.markRead(id);
+		} finally {
+			markStore.close();
+		}
+	}
+	return { drove: true, turnResult, messageIds: ids };
+}
+
 /**
  * Start a server-side mail dispatcher that drives the spawn-per-turn engine.
  *
@@ -137,35 +252,25 @@ export function startTurnRunnerMailLoop(
 			stop();
 			return { kind: "idle" };
 		}
-		const store = createMailStore(mailStorePath);
-		let messages: ReturnType<typeof store.getUnread>;
-		try {
-			messages = store.getUnread(agentName);
-		} finally {
-			store.close();
-		}
-		if (messages.length === 0) return { kind: "idle" };
-
-		const userTurnNdjson = encodeUserTurn(formatMailBatch(messages));
-		const ids = messages.map((m) => m.id);
 
 		inFlight = true;
 		try {
-			const result = await runTurnFn(optsFactory(userTurnNdjson));
-			// Mark read only on a clean turn — exit code 0 (or null on abort with
-			// no error) AND no thrown error. Failed turns leave messages unread
-			// so the next tick retries cleanly.
-			if (result.exitCode === 0) {
-				const markStore = createMailStore(mailStorePath);
-				try {
-					for (const id of ids) markStore.markRead(id);
-				} finally {
-					markStore.close();
-				}
+			const outcome = await dispatchUnreadOnce({
+				agentName,
+				optsFactory,
+				runTurnFn,
+				mailStorePath,
+			});
+			if (!outcome.drove || outcome.turnResult === undefined) {
+				return { kind: "idle" };
 			}
-			return { kind: "delivered", result, messageIds: ids };
+			return {
+				kind: "delivered",
+				result: outcome.turnResult,
+				messageIds: outcome.messageIds ?? [],
+			};
 		} catch (error) {
-			return { kind: "error", error, messageIds: ids };
+			return { kind: "error", error, messageIds: readMessageIds(error) };
 		} finally {
 			inFlight = false;
 		}
@@ -341,6 +446,13 @@ export async function _runPersistentMailTick(
 /**
  * Internal: run a single dispatcher tick. Exported for tests so they can
  * drive the loop deterministically without setInterval timing.
+ *
+ * Thin wrapper over {@link dispatchUnreadOnce} (no in-flight/liveness guards
+ * — those are `startTurnRunnerMailLoop`'s concern). `messageIds` on the
+ * translated result carries the claimed batch's ids for BOTH a delivered
+ * and an errored tick (via `outcome.messageIds` / `readMessageIds`), so a
+ * failed dispatch can still be correlated back to the mail batch that
+ * triggered it.
  */
 export async function _runTurnRunnerTick(
 	agentName: string,
@@ -348,30 +460,17 @@ export async function _runTurnRunnerTick(
 	runTurnFn: TurnRunnerFn,
 	mailStorePath: string,
 ): Promise<TurnRunnerTickResult> {
-	const store = createMailStore(mailStorePath);
-	let messages: ReturnType<typeof store.getUnread>;
 	try {
-		messages = store.getUnread(agentName);
-	} finally {
-		store.close();
-	}
-	if (messages.length === 0) return { kind: "idle" };
-
-	const userTurnNdjson = encodeUserTurn(formatMailBatch(messages));
-	const ids = messages.map((m) => m.id);
-
-	try {
-		const result = await runTurnFn(optsFactory(userTurnNdjson));
-		if (result.exitCode === 0) {
-			const markStore = createMailStore(mailStorePath);
-			try {
-				for (const id of ids) markStore.markRead(id);
-			} finally {
-				markStore.close();
-			}
+		const outcome = await dispatchUnreadOnce({ agentName, optsFactory, runTurnFn, mailStorePath });
+		if (!outcome.drove || outcome.turnResult === undefined) {
+			return { kind: "idle" };
 		}
-		return { kind: "delivered", result, messageIds: ids };
+		return {
+			kind: "delivered",
+			result: outcome.turnResult,
+			messageIds: outcome.messageIds ?? [],
+		};
 	} catch (error) {
-		return { kind: "error", error, messageIds: ids };
+		return { kind: "error", error, messageIds: readMessageIds(error) };
 	}
 }

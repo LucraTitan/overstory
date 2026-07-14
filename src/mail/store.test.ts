@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -518,6 +519,120 @@ describe("createMailStore", () => {
 				threadId: null,
 			});
 			expect(store.getAll({ type: "merge_ready" })).toHaveLength(0);
+		});
+
+		test("matches any of an array of types", () => {
+			store.insert({
+				id: "",
+				from: "reviewer-a",
+				to: "lead-a",
+				subject: "Review: t1 - PASS",
+				body: "done",
+				type: "worker_done",
+				priority: "normal",
+				threadId: null,
+			});
+			store.insert({
+				id: "",
+				from: "reviewer-b",
+				to: "lead-a",
+				subject: "Review: t2 - PASS",
+				body: "done",
+				type: "result",
+				priority: "normal",
+				threadId: null,
+			});
+			store.insert({
+				id: "",
+				from: "reviewer-c",
+				to: "lead-a",
+				subject: "status update",
+				body: "still going",
+				type: "status",
+				priority: "normal",
+				threadId: null,
+			});
+
+			const terminal = store.getAll({ type: ["worker_done", "result"] });
+			expect(terminal).toHaveLength(2);
+			expect(terminal.map((m) => m.from).sort()).toEqual(["reviewer-a", "reviewer-b"]);
+		});
+
+		test("finding 5: an empty type array matches NOTHING, not every type", () => {
+			// Before the fix, an empty array silently disabled the type filter
+			// entirely (fell through to no `type` condition at all), returning
+			// every row -- the opposite of "matches any of the supplied types"
+			// when the supplied set is empty.
+			store.insert({
+				id: "",
+				from: "agent-a",
+				to: "orchestrator",
+				subject: "msg1",
+				body: "body1",
+				type: "status",
+				priority: "normal",
+				threadId: null,
+			});
+			store.insert({
+				id: "",
+				from: "agent-b",
+				to: "orchestrator",
+				subject: "msg2",
+				body: "body2",
+				type: "worker_done",
+				priority: "normal",
+				threadId: null,
+			});
+
+			expect(store.getAll({ type: [] })).toHaveLength(0);
+		});
+
+		test("finding 2: afterRowid selection orders by rowid DESC exclusively -- a later (real) row outranks an earlier row forged with a future timestamp", () => {
+			const first = store.insert({
+				id: "",
+				from: "reviewer-race",
+				to: "reviewer-race",
+				subject: "Review: t1 - first — PASS",
+				body: "done",
+				type: "result",
+				priority: "normal",
+				threadId: null,
+			});
+			// Forge `first`'s created_at far into the future. A `created_at DESC`
+			// primary sort (even with `rowid DESC` only as a tiebreak) would rank
+			// this PASS ahead of the later-inserted, real-timestamped FAIL below
+			// -- exactly the bug finding 2 fixes.
+			const rawDb = new Database(join(tempDir, "mail.db"));
+			try {
+				rawDb.run("UPDATE messages SET created_at = ? WHERE id = ?", [
+					new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
+					first.id,
+				]);
+			} finally {
+				rawDb.close();
+			}
+
+			const second = store.insert({
+				id: "",
+				from: "reviewer-race",
+				to: "reviewer-race",
+				subject: "Review: t1 - second — FAIL",
+				body: "done",
+				type: "result",
+				priority: "normal",
+				threadId: null,
+			});
+
+			const results = store.getAll({
+				from: "reviewer-race",
+				type: ["worker_done", "result"],
+				afterRowid: 0,
+			});
+			expect(results).toHaveLength(2);
+			// The latest-by-rowid row (the real FAIL) must sort first, regardless
+			// of its forged-future-timestamped predecessor.
+			expect(results[0]?.id).toBe(second.id);
+			expect(results[0]?.subject).toContain("FAIL");
 		});
 	});
 

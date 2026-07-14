@@ -11,18 +11,39 @@ import { MailError } from "../errors.ts";
 import type { MailMessage, MailMessageType } from "../types.ts";
 import { MAIL_MESSAGE_TYPES } from "../types.ts";
 
+/**
+ * Filters shared by {@link MailStore.getAll} and `MailClient.list`.
+ *
+ * `type` accepts a single type OR an array (matches ANY of the given types)
+ * — a reviewer's terminal mail can legitimately be either `"worker_done"` or
+ * `"result"` (see `terminalMailTypesFor`), and `MailStore` previously had no
+ * way to query for either in one call (finding A).
+ *
+ * `afterRowid` filters to rows whose SQLite `rowid` is strictly greater than
+ * the given value — a MONOTONIC, collision-free alternative to filtering by
+ * `createdAt` (millisecond-resolution timestamps can collide under load, or
+ * be forged/replayed; `rowid` strictly reflects insertion order) (finding B).
+ * When `afterRowid` is supplied, results are also ORDERED by `rowid DESC`
+ * exclusively (never `created_at`) — an application-supplied timestamp on an
+ * earlier-inserted row could otherwise outrank a later, real insertion
+ * (finding 2). See `getMaxRowid`'s doc comment for the rowid-reuse caveat
+ * this snapshot pattern relies on.
+ */
+export interface MailFilters {
+	from?: string;
+	to?: string;
+	unread?: boolean;
+	type?: MailMessageType | MailMessageType[];
+	limit?: number;
+	afterRowid?: number;
+}
+
 export interface MailStore {
 	insert(
 		message: Omit<MailMessage, "read" | "createdAt" | "payload"> & { payload?: string | null },
 	): MailMessage;
 	getUnread(agentName: string): MailMessage[];
-	getAll(filters?: {
-		from?: string;
-		to?: string;
-		unread?: boolean;
-		type?: MailMessageType;
-		limit?: number;
-	}): MailMessage[];
+	getAll(filters?: MailFilters): MailMessage[];
 	getById(id: string): MailMessage | null;
 	getByThread(threadId: string): MailMessage[];
 	markRead(id: string): void;
@@ -30,6 +51,26 @@ export interface MailStore {
 	deleteById(id: string): boolean;
 	/** Delete messages matching the given criteria. Returns the number of messages deleted. */
 	purge(options: { all?: boolean; olderThanMs?: number; agent?: string }): number;
+	/**
+	 * Current maximum SQLite `rowid` across all messages (0 if the table is
+	 * empty). A monotonic sequence watermark — capture it BEFORE an event
+	 * (e.g. spawning a reviewer) and later filter with `afterRowid` to find
+	 * only mail inserted strictly after that instant (finding B).
+	 *
+	 * Finding 6 (documented, accepted leaner-scope gap — no code change):
+	 * plain SQLite `rowid` is REUSED after the current maximum row is deleted
+	 * (unlike an `AUTOINCREMENT` column, which never reuses a value even
+	 * across deletes). If mail were purged mid-review, a fresh verdict could
+	 * in principle be inserted at a rowid that is <= a stale snapshot,
+	 * wrongly excluding it. This cannot happen under drive's sole-supervisor
+	 * model — nothing in a drive run ever calls `purge`/`deleteById` on
+	 * `mail.db` while a reviewer's verdict is outstanding — so the snapshot
+	 * pattern is safe as used here. The full fix (an `AUTOINCREMENT` id or an
+	 * equivalent persistent counter column, immune to rowid reuse regardless
+	 * of caller) is a mail-wide schema migration and is deferred as out of
+	 * this leaner scope.
+	 */
+	getMaxRowid(): number;
 	close(): void;
 }
 
@@ -252,13 +293,7 @@ export function createMailStore(dbPath: string): MailStore {
 	`);
 
 	// Dynamic filter queries are built at call time since the WHERE clause varies
-	function buildFilterQuery(filters?: {
-		from?: string;
-		to?: string;
-		unread?: boolean;
-		type?: MailMessageType;
-		limit?: number;
-	}): MailMessage[] {
+	function buildFilterQuery(filters?: MailFilters): MailMessage[] {
 		const conditions: string[] = [];
 		const params: Record<string, string | number> = {};
 
@@ -275,8 +310,30 @@ export function createMailStore(dbPath: string): MailStore {
 			params.$read = filters.unread ? 0 : 1;
 		}
 		if (filters?.type !== undefined) {
-			conditions.push("type = $type");
-			params.$type = filters.type;
+			if (Array.isArray(filters.type)) {
+				// Finding 5: an explicitly empty `type` array means "match none of
+				// these types" -- i.e. no type can ever satisfy an empty allow-list
+				// -- so the query must return ZERO rows, not silently drop the
+				// filter (which previously returned EVERY type, contradicting
+				// "matches any supplied type"). `1 = 0` is a portable always-false
+				// condition.
+				if (filters.type.length > 0) {
+					const placeholders = filters.type.map((_, i) => `$type${i}`).join(",");
+					conditions.push(`type IN (${placeholders})`);
+					for (const [i, t] of filters.type.entries()) {
+						params[`$type${i}`] = t;
+					}
+				} else {
+					conditions.push("1 = 0");
+				}
+			} else {
+				conditions.push("type = $type");
+				params.$type = filters.type;
+			}
+		}
+		if (filters?.afterRowid !== undefined) {
+			conditions.push("rowid > $after_rowid");
+			params.$after_rowid = filters.afterRowid;
 		}
 
 		const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -284,7 +341,28 @@ export function createMailStore(dbPath: string): MailStore {
 		if (filters?.limit !== undefined) {
 			params.$limit = filters.limit;
 		}
-		const query = `SELECT * FROM messages ${whereClause} ORDER BY created_at DESC${limitClause}`;
+		// Finding 2: when filtering by `afterRowid` (a monotonic snapshot-based
+		// query, e.g. drive's reviewer-verdict selection), order by `rowid DESC`
+		// EXCLUSIVELY -- never `created_at`. `rowid` strictly reflects insertion
+		// order and cannot be forged/backdated; `created_at` is an
+		// application-supplied, millisecond-resolution wall-clock string that a
+		// later-inserted (and therefore authoritative) row can still lose to if
+		// an earlier-inserted row was stamped with a larger/future timestamp.
+		// Ordering by `created_at` first (as the default query below still does
+		// for all OTHER callers) would let such a stale-but-future-timestamped
+		// row outrank the true most-recent insertion, defeating the whole point
+		// of the rowid-gated snapshot (finding B / finding 2).
+		//
+		// For every other caller (no `afterRowid`), keep the prior
+		// `created_at DESC, rowid DESC` ordering with rowid as a pure tiebreak
+		// for millisecond-collisions (finding B) -- changing that default would
+		// be an unscoped behavior change for callers that intentionally want
+		// wall-clock-recency ordering.
+		const orderClause =
+			filters?.afterRowid !== undefined
+				? "ORDER BY rowid DESC"
+				: "ORDER BY created_at DESC, rowid DESC";
+		const query = `SELECT * FROM messages ${whereClause} ${orderClause}${limitClause}`;
 		const stmt = db.prepare<MessageRow, Record<string, string | number>>(query);
 		const rows = stmt.all(params);
 		return rows.map(rowToMessage);
@@ -335,13 +413,7 @@ export function createMailStore(dbPath: string): MailStore {
 			return rows.map(rowToMessage);
 		},
 
-		getAll(filters?: {
-			from?: string;
-			to?: string;
-			unread?: boolean;
-			type?: MailMessageType;
-			limit?: number;
-		}): MailMessage[] {
+		getAll(filters?: MailFilters): MailMessage[] {
 			return buildFilterQuery(filters);
 		},
 
@@ -409,6 +481,13 @@ export function createMailStore(dbPath: string): MailStore {
 			db.prepare<void, Record<string, string>>(deleteQuery).run(params);
 
 			return count;
+		},
+
+		getMaxRowid(): number {
+			const row = db
+				.prepare<{ max_rowid: number | null }, []>("SELECT MAX(rowid) as max_rowid FROM messages")
+				.get();
+			return row?.max_rowid ?? 0;
 		},
 
 		close(): void {

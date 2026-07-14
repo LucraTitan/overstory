@@ -21,7 +21,7 @@ import { predictConflicts } from "../merge/predict.ts";
 import { createMergeQueue } from "../merge/queue.ts";
 import { createMergeResolver } from "../merge/resolver.ts";
 import { createMulchClient } from "../mulch/client.ts";
-import type { ConflictPrediction, MergeEntry, MergeResult } from "../types.ts";
+import type { ConflictPrediction, MergeEntry, MergeResult, ResolutionTier } from "../types.ts";
 
 export interface MergeOptions {
 	branch?: string;
@@ -159,6 +159,177 @@ async function safePredictForEntry(
 	}
 }
 
+/** Options for the {@link mergeBranch} service. Mirrors the CLI's `--dry-run`/`--into` flags. */
+export interface MergeBranchOpts {
+	dryRun?: boolean;
+	into?: string;
+}
+
+/**
+ * Structured outcome of a single-branch merge attempt.
+ *
+ * - `"merged"`   — the branch was merged into the target branch cleanly.
+ * - `"conflict"` — the merge attempt produced unresolved conflicts.
+ * - `"failed"`   — the merge attempt failed for a reason other than a
+ *                  content conflict (resolver error with no conflict files).
+ * - `"noop"`     — no merge was attempted (dry-run: this is a prediction only).
+ */
+export type MergeBranchOutcome = "merged" | "conflict" | "noop" | "failed";
+
+export interface MergeBranchResult {
+	outcome: MergeBranchOutcome;
+	branch: string;
+	tier?: ResolutionTier;
+	conflicts?: string[];
+	errorMessage?: string;
+	/** The merge-queue entry for this branch (created if it did not already exist). */
+	entry: MergeEntry;
+	/** Present when `dryRun` was requested — the conflict prediction. */
+	prediction?: ConflictPrediction;
+	/** Present for a real (non-dry-run) merge attempt — the resolver's raw result. */
+	result?: MergeResult;
+}
+
+/**
+ * Programmatic, structured single-branch merge service.
+ *
+ * Extracted from `handleBranch` (overstory ov-drive-completion Phase 1) so a
+ * future headless run-to-completion driver can merge a branch and inspect a
+ * typed outcome instead of parsing CLI stdout / catching `MergeError`. Owns
+ * its own config load, target-branch resolution (`--into` > session-branch.txt
+ * > canonicalBranch), and merge lock — callers must NOT also hold the lock
+ * for the same target branch, or `acquireMergeLock` will see its own PID as
+ * a live holder and throw.
+ *
+ * `ov merge --branch <name>` (via `handleBranch`) delegates to this function
+ * and prints the same output as before using `entry`/`prediction`/`result`.
+ */
+export async function mergeBranch(
+	branchName: string,
+	opts: MergeBranchOpts = {},
+): Promise<MergeBranchResult> {
+	const dryRun = opts.dryRun ?? false;
+
+	const cwd = process.cwd();
+	const config = await loadConfig(cwd);
+
+	// Resolution chain: --into flag > session-start branch > config canonicalBranch
+	let sessionBranch: string | null = null;
+	if (opts.into === undefined) {
+		const sessionBranchPath = join(config.project.root, ".overstory", "session-branch.txt");
+		const sessionBranchFile = Bun.file(sessionBranchPath);
+		if (await sessionBranchFile.exists()) {
+			const content = (await sessionBranchFile.text()).trim();
+			if (content) {
+				sessionBranch = content;
+			}
+		}
+	}
+	const targetBranch = opts.into ?? sessionBranch ?? config.project.canonicalBranch;
+	const repoRoot = config.project.root;
+	const queuePath = join(repoRoot, ".overstory", "merge-queue.db");
+	const queue = createMergeQueue(queuePath);
+	const mulchClient = createMulchClient(repoRoot);
+	const resolver = createMergeResolver({
+		aiResolveEnabled: config.merge.aiResolveEnabled,
+		reimagineEnabled: config.merge.reimagineEnabled,
+		mulchClient,
+	});
+
+	// Dry-run is read-only with respect to git state — no lock needed. The
+	// real merge path acquires a lock on the target branch so a parallel
+	// `ov merge` can't observe in-progress conflict markers and report a
+	// false failure (seeds: overstory-9610).
+	const lock = dryRun ? null : acquireMergeLock(join(repoRoot, ".overstory"), targetBranch);
+
+	try {
+		// Look for existing entry in the queue
+		const allEntries = queue.list();
+		let entry = allEntries.find((e) => e.branchName === branchName) ?? null;
+
+		// If not in queue, create one by detecting info from the branch
+		if (entry === null) {
+			// Validate that the branch exists before attempting any git operations
+			const verifyProc = Bun.spawn(["git", "rev-parse", "--verify", `refs/heads/${branchName}`], {
+				cwd: repoRoot,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const verifyExit = await verifyProc.exited;
+			if (verifyExit !== 0) {
+				throw new ValidationError(`Branch "${branchName}" not found`, {
+					field: "branch",
+					value: branchName,
+				});
+			}
+
+			const agentName = parseAgentName(branchName);
+			const taskId = parseTaskId(branchName);
+			const filesModified = await detectModifiedFiles(repoRoot, targetBranch, branchName);
+
+			entry = queue.enqueue({
+				branchName,
+				taskId,
+				agentName,
+				filesModified,
+			});
+		}
+
+		if (dryRun) {
+			const prediction = await safePredictForEntry(entry, targetBranch, repoRoot, mulchClient);
+			return {
+				outcome: "noop",
+				branch: branchName,
+				tier: prediction.predictedTier,
+				conflicts: prediction.conflictFiles.length > 0 ? prediction.conflictFiles : undefined,
+				entry,
+				prediction,
+			};
+		}
+
+		// Perform the actual merge
+		const result = await resolver.resolve(entry, targetBranch, repoRoot);
+
+		// Update queue status based on result
+		queue.updateStatus(branchName, result.success ? "merged" : "conflict", result.tier);
+
+		if (result.success) {
+			return { outcome: "merged", branch: branchName, tier: result.tier, entry, result };
+		}
+		if (result.conflictFiles.length > 0) {
+			return {
+				outcome: "conflict",
+				branch: branchName,
+				tier: result.tier,
+				conflicts: result.conflictFiles,
+				errorMessage: result.errorMessage ?? undefined,
+				entry,
+				result,
+			};
+		}
+		return {
+			outcome: "failed",
+			branch: branchName,
+			tier: result.tier,
+			errorMessage: result.errorMessage ?? undefined,
+			entry,
+			result,
+		};
+	} finally {
+		// Release the lock before closing the queue's DB handle so a stuck
+		// `close()` can never skip lock release. `mergeBranch` is designed to
+		// be called repeatedly by a long-running driver (unlike the one-shot
+		// CLI process) — leaving `queue` open would accumulate SQLite handles
+		// + prepared statements across calls (matches the close-on-exit
+		// pattern already used at coordinator.ts's merge-queue check).
+		try {
+			lock?.release();
+		} finally {
+			queue.close();
+		}
+	}
+}
+
 /**
  * Entry point for `ov merge [flags]`.
  *
@@ -175,6 +346,15 @@ export async function mergeCommand(opts: MergeOptions): Promise<void> {
 		throw new ValidationError("Either --branch <name> or --all is required for ov merge", {
 			field: "branch|all",
 		});
+	}
+
+	if (branchName) {
+		// Single-branch path is fully owned by `mergeBranch` (config load,
+		// target-branch resolution, and merge lock all live inside the
+		// service) so a driver can call it directly without this CLI wrapper
+		// also holding the lock — see mergeBranch's doc comment.
+		await handleBranch(branchName, dryRun, json, into);
+		return;
 	}
 
 	const cwd = process.cwd();
@@ -211,82 +391,37 @@ export async function mergeCommand(opts: MergeOptions): Promise<void> {
 		: acquireMergeLock(join(config.project.root, ".overstory"), targetBranch);
 
 	try {
-		if (branchName) {
-			await handleBranch(branchName, queue, resolver, config, targetBranch, dryRun, json);
-		} else {
-			await handleAll(queue, resolver, config, targetBranch, dryRun, json);
-		}
+		await handleAll(queue, resolver, config, targetBranch, dryRun, json);
 	} finally {
 		lock?.release();
 	}
 }
 
 /**
- * Handle merging a specific branch.
- * If the branch is not in the queue, creates a new entry by detecting
- * agent name, task ID, and modified files from git.
+ * Handle merging a specific branch. Thin CLI wrapper over {@link mergeBranch}:
+ * prints the same stdout/JSON shape `ov merge --branch` has always produced,
+ * and throws `MergeError` on a failed/conflicted merge (unchanged CLI contract).
  */
 async function handleBranch(
 	branchName: string,
-	queue: ReturnType<typeof createMergeQueue>,
-	resolver: ReturnType<typeof createMergeResolver>,
-	config: Awaited<ReturnType<typeof loadConfig>>,
-	targetBranch: string,
 	dryRun: boolean,
 	json: boolean,
+	into: string | undefined,
 ): Promise<void> {
-	const canonicalBranch = targetBranch;
-	const repoRoot = config.project.root;
-
-	// Look for existing entry in the queue
-	const allEntries = queue.list();
-	let entry = allEntries.find((e) => e.branchName === branchName) ?? null;
-
-	// If not in queue, create one by detecting info from the branch
-	if (entry === null) {
-		// Validate that the branch exists before attempting any git operations
-		const verifyProc = Bun.spawn(["git", "rev-parse", "--verify", `refs/heads/${branchName}`], {
-			cwd: repoRoot,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const verifyExit = await verifyProc.exited;
-		if (verifyExit !== 0) {
-			throw new ValidationError(`Branch "${branchName}" not found`, {
-				field: "branch",
-				value: branchName,
-			});
-		}
-
-		const agentName = parseAgentName(branchName);
-		const taskId = parseTaskId(branchName);
-		const filesModified = await detectModifiedFiles(repoRoot, canonicalBranch, branchName);
-
-		entry = queue.enqueue({
-			branchName,
-			taskId,
-			agentName,
-			filesModified,
-		});
-	}
+	const mergeResult = await mergeBranch(branchName, { dryRun, into });
 
 	if (dryRun) {
-		const mulchClient = createMulchClient(config.project.root);
-		const prediction = await safePredictForEntry(entry, canonicalBranch, repoRoot, mulchClient);
-
 		if (json) {
-			jsonOutput("merge", { ...entry, prediction });
+			jsonOutput("merge", { ...mergeResult.entry, prediction: mergeResult.prediction });
 		} else {
-			process.stdout.write(`${formatDryRun(entry, prediction)}\n`);
+			process.stdout.write(`${formatDryRun(mergeResult.entry, mergeResult.prediction)}\n`);
 		}
 		return;
 	}
 
-	// Perform the actual merge
-	const result = await resolver.resolve(entry, canonicalBranch, repoRoot);
-
-	// Update queue status based on result
-	queue.updateStatus(branchName, result.success ? "merged" : "conflict", result.tier);
+	// Non-dry-run always sets `result` (mergeBranch only omits it on the
+	// dry-run/`noop` path above).
+	const result = mergeResult.result as MergeResult;
 
 	if (json) {
 		jsonOutput("merge", { ...result });

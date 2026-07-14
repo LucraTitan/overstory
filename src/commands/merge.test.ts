@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { readdirSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { MergeError, ValidationError } from "../errors.ts";
@@ -12,7 +12,7 @@ import {
 	getDefaultBranch,
 	runGitInDir,
 } from "../test-helpers.ts";
-import { mergeCommand } from "./merge.ts";
+import { mergeBranch, mergeCommand } from "./merge.ts";
 
 describe("mergeCommand", () => {
 	let repoDir: string;
@@ -858,4 +858,135 @@ merge:
 			expect(sharedFile).toBe("feature branch content");
 		});
 	});
+});
+
+describe("mergeBranch (service)", () => {
+	let repoDir: string;
+	let defaultBranch: string;
+	let originalCwd: string;
+
+	beforeEach(async () => {
+		originalCwd = process.cwd();
+		repoDir = await createTempGitRepo();
+		defaultBranch = await getDefaultBranch(repoDir);
+		process.chdir(repoDir);
+	});
+
+	afterEach(async () => {
+		process.chdir(originalCwd);
+		await cleanupTempDir(repoDir);
+	});
+
+	async function setupProject(dir: string, canonicalBranch: string): Promise<void> {
+		const overstoryDir = join(dir, ".overstory");
+		await mkdir(overstoryDir);
+
+		const configYaml = `project:
+  canonicalBranch: ${canonicalBranch}
+  root: ${dir}
+
+merge:
+  aiResolveEnabled: false
+  reimagineEnabled: false
+`;
+		await Bun.write(join(overstoryDir, "config.yaml"), configYaml);
+	}
+
+	async function createCleanFeatureBranch(dir: string, branchName: string): Promise<void> {
+		const baseFilePath = join(dir, "src/base.ts");
+		const baseFileExists = await Bun.file(baseFilePath).exists();
+		if (!baseFileExists) {
+			await commitFile(dir, "src/base.ts", "base content");
+		}
+		await runGitInDir(dir, ["checkout", "-b", branchName]);
+		await commitFile(dir, `src/${branchName}.ts`, "feature content");
+		await runGitInDir(dir, ["checkout", defaultBranch]);
+	}
+
+	test("returns outcome 'merged' with tier 'clean-merge' for a non-conflicting branch", async () => {
+		await setupProject(repoDir, defaultBranch);
+		const branchName = "overstory/builder/bead-service-clean";
+		await createCleanFeatureBranch(repoDir, branchName);
+
+		const result = await mergeBranch(branchName);
+
+		expect(result.outcome).toBe("merged");
+		expect(result.branch).toBe(branchName);
+		expect(result.tier).toBe("clean-merge");
+		expect(result.entry.branchName).toBe(branchName);
+		expect(result.result?.success).toBe(true);
+	});
+
+	test("returns outcome 'conflict' with conflicting file listed when resolution tiers are disabled", async () => {
+		await setupProject(repoDir, defaultBranch);
+
+		// Contentful-canonical conflict: base -> diverge on feature branch ->
+		// diverge again on canonical. With aiResolveEnabled/reimagineEnabled
+		// both false (setupProject default), auto-resolve is skipped (the
+		// canonical side has real content) and no higher tier is available,
+		// so the resolver returns success:false with conflictFiles populated.
+		await commitFile(repoDir, "src/shared.ts", "shared base\n");
+		const branchName = "overstory/builder/bead-service-conflict";
+		await runGitInDir(repoDir, ["checkout", "-b", branchName]);
+		await commitFile(repoDir, "src/shared.ts", "feature side\n");
+		await runGitInDir(repoDir, ["checkout", defaultBranch]);
+		await commitFile(repoDir, "src/shared.ts", "main side\n");
+
+		const result = await mergeBranch(branchName);
+
+		expect(result.outcome).toBe("conflict");
+		expect(result.branch).toBe(branchName);
+		expect(result.conflicts).toContain("src/shared.ts");
+		expect(result.result?.success).toBe(false);
+	});
+
+	test("dry-run returns outcome 'noop' with a prediction and does not touch git state", async () => {
+		await setupProject(repoDir, defaultBranch);
+		const branchName = "overstory/builder/bead-service-dryrun";
+		await createCleanFeatureBranch(repoDir, branchName);
+
+		const result = await mergeBranch(branchName, { dryRun: true });
+
+		expect(result.outcome).toBe("noop");
+		expect(result.tier).toBe("clean-merge");
+		expect(result.prediction).toBeDefined();
+		expect(result.result).toBeUndefined();
+
+		// Confirm no lock file was left behind for a dry-run.
+		const lockPath = mergeLockPath(join(repoDir, ".overstory"), defaultBranch);
+		expect(await Bun.file(lockPath).exists()).toBe(false);
+	});
+
+	// /proc/self/fd is Linux-specific; skip on other platforms rather than
+	// reimplementing FD introspection per-OS for a regression test.
+	test.skipIf(process.platform !== "linux")(
+		"closes the merge-queue DB handle after each call (no FD leak across repeated calls)",
+		async () => {
+			await setupProject(repoDir, defaultBranch);
+
+			const countOpenFds = (): number => readdirSync("/proc/self/fd").length;
+
+			// Warm-up call so any one-time module-init file handles (e.g. lazy
+			// requires) don't get counted as part of the per-call delta below.
+			const warmupBranch = "overstory/builder/bead-fd-warmup";
+			await createCleanFeatureBranch(repoDir, warmupBranch);
+			await mergeBranch(warmupBranch);
+
+			const before = countOpenFds();
+			const iterations = 8;
+			for (let i = 0; i < iterations; i++) {
+				const branchName = `overstory/builder/bead-fd-${i}`;
+				await createCleanFeatureBranch(repoDir, branchName);
+				await mergeBranch(branchName);
+			}
+			const after = countOpenFds();
+
+			// Each call opens a merge-queue SQLite handle (plus lock file, git
+			// subprocess pipes); a leak grows FD count ~linearly with the loop
+			// count. A small constant slack absorbs unrelated fd churn (subprocess
+			// pipe reuse, GC timing) without masking a real per-call leak — 8
+			// leaked handles would fail this bound even with slack.
+			expect(after - before).toBeLessThan(iterations);
+		},
+	);
 });

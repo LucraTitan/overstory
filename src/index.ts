@@ -18,6 +18,7 @@ import { createCostsCommand } from "./commands/costs.ts";
 import { createDashboardCommand } from "./commands/dashboard.ts";
 import { createDiscoverCommand } from "./commands/discover.ts";
 import { createDoctorCommand } from "./commands/doctor.ts";
+import { createDriveCommand } from "./commands/drive.ts";
 import { createEcosystemCommand } from "./commands/ecosystem.ts";
 import { createErrorsCommand } from "./commands/errors.ts";
 import { createFeedCommand } from "./commands/feed.ts";
@@ -82,6 +83,7 @@ const COMMANDS = [
 	"status",
 	"dashboard",
 	"discover",
+	"drive",
 	"inspect",
 	"clean",
 	"doctor",
@@ -255,6 +257,7 @@ program.addCommand(createLogCommand());
 program.addCommand(createWatchCommand());
 program.addCommand(createGroupCommand());
 program.addCommand(createServeCommand());
+program.addCommand(createDriveCommand());
 program.addCommand(createCompletionsCommand());
 
 // Unmigrated commands — passthrough pattern
