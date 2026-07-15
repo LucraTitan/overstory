@@ -2261,6 +2261,93 @@ describe("driveCommand", () => {
 		expect(capturedSourceCommit).toBe(headSha);
 	});
 
+	test("round-3 item 2 (REAL merge): mergeBranch({ sourceCommit }) lands EXACTLY the reviewed sha, never a later branch tip", async () => {
+		// Directly exercises the real merge.ts/resolver.ts sourceCommit path (no
+		// drive, no fake merge): create a branch at commit A (adds reviewed.txt),
+		// ADVANCE it to commit B (adds raced.txt), then merge with
+		// sourceCommit=<A>. Only A's change must land — proving an advanced tip
+		// can never be merged in place of the reviewed sha (round-2 blocker 2 +
+		// the round-3 exact-SHA regression coverage the review asked for).
+		const branch = "overstory/builder-exact/task-exact";
+		const gitEnv = { ...process.env, ...GIT_TEST_ENV };
+		const run = (args: string[]) => {
+			const p = Bun.spawnSync(["git", ...args], { cwd: tempDir, env: gitEnv });
+			if (p.exitCode !== 0) {
+				throw new Error(`git ${args.join(" ")} failed: ${new TextDecoder().decode(p.stderr)}`);
+			}
+			return new TextDecoder().decode(p.stdout).trim();
+		};
+
+		// Commit A on the branch — the "reviewed" commit.
+		run(["checkout", "-b", branch]);
+		writeFileSync(join(tempDir, "reviewed.txt"), "reviewed content\n");
+		run(["add", "-A"]);
+		run(["commit", "-m", "A: reviewed commit"]);
+		const reviewedSha = run(["rev-parse", "HEAD"]);
+
+		// Commit B — advance the branch tip AFTER the review baseline.
+		writeFileSync(join(tempDir, "raced.txt"), "raced content that must never land\n");
+		run(["add", "-A"]);
+		run(["commit", "-m", "B: raced commit (advances the branch tip)"]);
+		expect(run(["rev-parse", "HEAD"])).not.toBe(reviewedSha);
+
+		// Back to canonical and merge EXACTLY the reviewed sha.
+		run(["checkout", "main"]);
+		const res = await mergeBranch(branch, { sourceCommit: reviewedSha });
+
+		expect(res.outcome).toBe("merged");
+		// The reviewed commit's change landed; the raced (advanced-tip) change did NOT.
+		expect(await Bun.file(join(tempDir, "reviewed.txt")).exists()).toBe(true);
+		expect(await Bun.file(join(tempDir, "raced.txt")).exists()).toBe(false);
+		// Canonical HEAD reaches the reviewed sha but NOT the raced tip.
+		const isAncestor = (sha: string) =>
+			Bun.spawnSync(["git", "merge-base", "--is-ancestor", sha, "HEAD"], {
+				cwd: tempDir,
+				env: gitEnv,
+			}).exitCode === 0;
+		expect(isAncestor(reviewedSha)).toBe(true);
+		expect(isAncestor(run(["rev-parse", branch]))).toBe(false);
+	});
+
+	test("round-3 HIGH: a combined gate that finishes past the wall-clock deadline reports 'breaker' (timeout), never 'merged'", async () => {
+		const overstoryDir = join(tempDir, ".overstory");
+		const { tracker, closedIds } = makeFakeTracker();
+		// Controlled clock: the gate stub jumps it well past the run's deadline to
+		// simulate a gate that ran long. Every check BEFORE the gate sees the
+		// original instant, so only the post-gate deadline re-check trips.
+		let fakeNow = 1_000_000_000_000;
+		const now = () => fakeNow;
+		const _spawnFn = twoBuilderSpawn({
+			overstoryDir,
+			seedId: "seed-gatetimeout",
+			secondAgentName: "fake-builder-2gto",
+			secondBranch: "fake-builder2gto-branch",
+			secondTaskId: "seed-gatetimeout-part2",
+		});
+		const slowGate = async () => {
+			// Jump ~5000s — far past the default 1800s wall-clock deadline.
+			fakeNow += 5_000_000;
+			return { status: "success" as const, results: [], totalDurationMs: 1 };
+		};
+
+		const result = await driveCommand(
+			"seed-gatetimeout",
+			{ capability: "builder" },
+			{ _spawnFn, tracker, runQualityGatesFn: slowGate, now },
+		);
+
+		// The gate "passed", but the run exceeded its wall-clock timeout DURING the
+		// gate -> the circuit breaker wins: breaker/timeout, NOT merged, seed not closed.
+		expect(result.outcome).toBe("breaker");
+		expect(result.breaker?.kind).toBe("timeout");
+		expect(closedIds).toEqual([]);
+		// The branches that already merged are still disclosed.
+		expect(result.mergedBranches?.length).toBe(2);
+		// Both branches' work really did land (breaker doesn't unwind merges).
+		expect(await Bun.file(join(tempDir, "drive-output.txt")).exists()).toBe(true);
+		expect(await Bun.file(join(tempDir, "drive-output-2.txt")).exists()).toBe(true);
+	});
+
 	test.skipIf(!HAS_SD)(
 		"round-2 HIGH-1 (production fidelity): a REAL seeds seed pre-closed mid-run by the builder is reopened to a workable status on 'merged_partial'",
 		async () => {

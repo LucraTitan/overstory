@@ -117,29 +117,24 @@ const DEFAULT_NO_PROGRESS_SWEEP_LIMIT = 3;
 const PREDICTION_FAILED_PREFIX = "prediction-failed:";
 
 /**
- * Tracker statuses treated as TERMINAL (not workable) when VERIFYING a
- * seed-reopen (round-2 HIGH-1). Anything NOT in this set is treated as
- * workable/non-terminal — deliberately the safe direction: a false "workable"
- * only suppresses a diagnostic, whereas a false "terminal" would raise a
- * spurious "could not reopen" alarm. Both the seeds and beads adapters model
- * the workable state as `in_progress` (their `claim()` op); `open` is the
- * natural pre-work state. Compared case-insensitively.
+ * Tracker statuses that count as WORKABLE (non-terminal, actionable) when
+ * VERIFYING a seed-reopen (round-2 HIGH-1). These are exactly the two states
+ * the seeds and beads adapters use for an open/claimed issue: a fresh issue is
+ * `open`, and `claim()` — the reopen op both adapters implement as
+ * `update --status in_progress` — lands the issue at `in_progress`. A verified
+ * reopen MUST result in one of these.
+ *
+ * Deliberately a WHITELIST against the known tracker contract, not a terminal
+ * blacklist: for a VERIFICATION, an UNRECOGNIZED resulting status must fail
+ * CLOSED (surface a diagnostic) rather than be silently assumed workable just
+ * because it is not on a hand-maintained terminal list. Hyphen/underscore
+ * variants are normalized; compared case-insensitively.
  */
-const TERMINAL_SEED_STATUSES = new Set([
-	"closed",
-	"done",
-	"resolved",
-	"complete",
-	"completed",
-	"cancelled",
-	"canceled",
-	"wont_fix",
-	"wontfix",
-]);
+const WORKABLE_SEED_STATUSES = new Set(["open", "in_progress"]);
 
-/** True when `status` is NOT a known terminal tracker status (see {@link TERMINAL_SEED_STATUSES}). */
+/** True when `status` is a known WORKABLE (non-terminal) tracker status (see {@link WORKABLE_SEED_STATUSES}). */
 function isWorkableSeedStatus(status: string): boolean {
-	return !TERMINAL_SEED_STATUSES.has(status.trim().toLowerCase());
+	return WORKABLE_SEED_STATUSES.has(status.trim().toLowerCase().replace(/-/g, "_"));
 }
 
 /**
@@ -268,7 +263,11 @@ export interface DriveDeps {
 	 * `bun test`/`bun run lint`/`bun run typecheck` succeeding against a
 	 * bare temp fixture repo.
 	 */
-	runQualityGatesFn?: (gates: QualityGate[], cwd: string) => Promise<QualityGateOutcome | null>;
+	runQualityGatesFn?: (
+		gates: QualityGate[],
+		cwd: string,
+		options?: { timeoutMs?: number },
+	) => Promise<QualityGateOutcome | null>;
 }
 
 function assertPositiveInt(raw: string | undefined, fallback: number, field: string): number {
@@ -1173,12 +1172,35 @@ export async function driveCommand(
 				const gates: QualityGate[] = config.project.qualityGates ?? [];
 				let gateOutcome: QualityGateOutcome | null;
 				try {
-					gateOutcome = await runQualityGatesFn(gates, config.project.root);
+					// Round-3 HIGH fix: bound the combined gate by the run's REMAINING
+					// wall-clock deadline so it can never run past the `--timeout`
+					// circuit breaker (its own per-gate default is far longer). A
+					// zero/near-zero budget means the deadline already elapsed — the
+					// post-gate re-check below then reports `breaker`.
+					const remainingMs = Math.max(0, deadlineAtMs - now());
+					gateOutcome = await runQualityGatesFn(gates, config.project.root, {
+						timeoutMs: remainingMs,
+					});
 				} catch {
 					// A gate-runner crash is itself an integration-verification
 					// failure, not a clean pass -- fail closed rather than silently
 					// treating "we could not check" as "it's fine".
 					gateOutcome = { status: "failure", results: [], totalDurationMs: 0 };
+				}
+				// Round-3 HIGH fix: re-check the wall-clock deadline AFTER the gate
+				// ran. A gate that finished at/after the deadline must NOT let the run
+				// fall through to "merged" + close the seed past its circuit breaker;
+				// honor the timeout and report `breaker` instead (checked BEFORE the
+				// gate outcome so a deadline-killed gate is a timeout, not a spurious
+				// integration_failed). Branches that already merged are still disclosed.
+				const postGateBreaker = checkDeadlineAbort();
+				if (postGateBreaker) {
+					return await finish("breaker", {
+						breaker: postGateBreaker,
+						mergedBranch: mergedBranchNames[0],
+						mergedBranches: mergedBranchNames,
+						builderOutcomes,
+					});
 				}
 				// Round-2 HIGH-3 fail-closed fix: a `null` result means NO combined
 				// verification actually ran -- `runQualityGates` returns null for an
