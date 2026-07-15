@@ -25,8 +25,25 @@ import type {
 } from "../types.ts";
 
 export interface MergeResolver {
-	/** Attempt to merge the entry's branch into the canonical branch with tiered resolution. */
-	resolve(entry: MergeEntry, canonicalBranch: string, repoRoot: string): Promise<MergeResult>;
+	/**
+	 * Attempt to merge the entry's branch into the canonical branch with tiered
+	 * resolution.
+	 *
+	 * `mergeSource` decouples the LOGICAL branch identity (`entry.branchName` —
+	 * used for queue bookkeeping, conflict-pattern recording, and display) from
+	 * the exact commit-ish actually merged. When omitted it defaults to
+	 * `entry.branchName` (unchanged behavior for every existing caller). A
+	 * caller that has already reviewed and pinned an exact commit (e.g. `ov
+	 * drive`) passes that sha here so the resolver merges EXACTLY the reviewed
+	 * commit, immune to the mutable branch ref advancing after review — without
+	 * needing a throwaway ref or a second queue identity.
+	 */
+	resolve(
+		entry: MergeEntry,
+		canonicalBranch: string,
+		repoRoot: string,
+		mergeSource?: string,
+	): Promise<MergeResult>;
 }
 
 /**
@@ -233,10 +250,14 @@ async function writeFile(filePath: string, content: string): Promise<void> {
  * Returns true if the merge succeeds with no conflicts.
  */
 async function tryCleanMerge(
-	entry: MergeEntry,
 	repoRoot: string,
+	mergeSource: string,
 ): Promise<{ success: boolean; conflictFiles: string[] }> {
-	const { exitCode } = await runGit(repoRoot, ["merge", "--no-edit", entry.branchName]);
+	// Merge the exact `mergeSource` commit-ish (defaults to `entry.branchName`
+	// at the call site) — `git merge` accepts any commit-ish, so an exact sha
+	// merges the reviewed commit rather than whatever the branch ref points at
+	// now.
+	const { exitCode } = await runGit(repoRoot, ["merge", "--no-edit", mergeSource]);
 
 	if (exitCode === 0) {
 		return { success: true, conflictFiles: [] };
@@ -416,7 +437,8 @@ async function tryReimagine(
 	entry: MergeEntry,
 	canonicalBranch: string,
 	repoRoot: string,
-	config?: OverstoryConfig,
+	config: OverstoryConfig | undefined,
+	mergeSource: string,
 ): Promise<{ success: boolean }> {
 	// Abort the current merge
 	await runGit(repoRoot, ["merge", "--abort"]);
@@ -429,10 +451,12 @@ async function tryReimagine(
 				`${canonicalBranch}:${file}`,
 			]);
 
-			// Get the branch version
+			// Get the branch version — read from the exact `mergeSource` commit-ish
+			// (defaults to `entry.branchName`) so a reimagine reads the SAME
+			// reviewed content the clean/auto/ai tiers would have merged.
 			const { stdout: branchContent, exitCode: catBranchCode } = await runGit(repoRoot, [
 				"show",
-				`${entry.branchName}:${file}`,
+				`${mergeSource}:${file}`,
 			]);
 
 			if (catCanonicalCode !== 0 || catBranchCode !== 0) {
@@ -668,7 +692,13 @@ export function createMergeResolver(options: {
 			entry: MergeEntry,
 			canonicalBranch: string,
 			repoRoot: string,
+			mergeSourceArg?: string,
 		): Promise<MergeResult> {
+			// The exact commit-ish to merge. Defaults to the logical branch name
+			// so every existing caller is unchanged; a caller with an
+			// already-reviewed sha passes it to merge exactly that commit while
+			// all identity/bookkeeping below stays keyed on `entry.branchName`.
+			const mergeSource = mergeSourceArg ?? entry.branchName;
 			// Check current branch — skip checkout if already on canonical.
 			// Avoids "already checked out" error when worktrees exist.
 			const { stdout: currentRef, exitCode: refCode } = await runGit(repoRoot, [
@@ -758,7 +788,7 @@ export function createMergeResolver(options: {
 				}
 
 				// Tier 1: Clean merge
-				const cleanResult = await tryCleanMerge(entry, repoRoot);
+				const cleanResult = await tryCleanMerge(repoRoot, mergeSource);
 				if (cleanResult.success) {
 					if (options.onMergeSuccess) {
 						try {
@@ -876,6 +906,7 @@ export function createMergeResolver(options: {
 						canonicalBranch,
 						repoRoot,
 						options.config,
+						mergeSource,
 					);
 					if (reimagineResult.success) {
 						if (options.mulchClient) {
