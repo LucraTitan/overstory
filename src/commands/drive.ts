@@ -117,6 +117,32 @@ const DEFAULT_NO_PROGRESS_SWEEP_LIMIT = 3;
 const PREDICTION_FAILED_PREFIX = "prediction-failed:";
 
 /**
+ * Tracker statuses treated as TERMINAL (not workable) when VERIFYING a
+ * seed-reopen (round-2 HIGH-1). Anything NOT in this set is treated as
+ * workable/non-terminal — deliberately the safe direction: a false "workable"
+ * only suppresses a diagnostic, whereas a false "terminal" would raise a
+ * spurious "could not reopen" alarm. Both the seeds and beads adapters model
+ * the workable state as `in_progress` (their `claim()` op); `open` is the
+ * natural pre-work state. Compared case-insensitively.
+ */
+const TERMINAL_SEED_STATUSES = new Set([
+	"closed",
+	"done",
+	"resolved",
+	"complete",
+	"completed",
+	"cancelled",
+	"canceled",
+	"wont_fix",
+	"wontfix",
+]);
+
+/** True when `status` is NOT a known terminal tracker status (see {@link TERMINAL_SEED_STATUSES}). */
+function isWorkableSeedStatus(status: string): boolean {
+	return !TERMINAL_SEED_STATUSES.has(status.trim().toLowerCase());
+}
+
+/**
  * Terminal outcome of one `ov drive` invocation.
  *
  * `"merged_partial"` (F3 fix): a multi-builder run where SOME but not ALL
@@ -133,12 +159,24 @@ const PREDICTION_FAILED_PREFIX = "prediction-failed:";
  * two individually clean, non-conflicting branches can still integrate into
  * a broken combined build; this outcome exists so that case is never
  * silently reported as `"merged"`. Deliberately NOT a success outcome —
- * same non-zero-exit / seed-left-open treatment as `"merged_partial"`.
+ * same non-zero-exit / seed-left-workable treatment as `"merged_partial"`.
+ *
+ * `"integration_unverified"` (round-2 HIGH-3 fail-closed fix): every builder
+ * branch merged individually, but the COMBINED canonical state could NOT be
+ * verified at all — the combined quality-gate run returned no result (`null`
+ * from `runQualityGates`, which happens when NO gates are configured, i.e.
+ * an explicit `qualityGates: []`). An unverified integration is NOT a
+ * success: silently reporting `"merged"` here would be exactly the fail-open
+ * this guards against. Distinct from `"integration_failed"` (gates ran and
+ * FAILED) so operators can tell "no safety net" from "safety net caught a
+ * break". Same non-zero-exit / seed-left-workable treatment as the other two
+ * incomplete outcomes.
  */
 export type DriveOutcome =
 	| "merged"
 	| "merged_partial"
 	| "integration_failed"
+	| "integration_unverified"
 	| "review_failed"
 	| "merge_blocked"
 	| "breaker"
@@ -165,12 +203,15 @@ export interface DriveBuilderOutcome {
  * Structured result of a drive run — also the `--json` output shape.
  *
  * Schema note (review-round LOW-6): `mergedBranches` and `builderOutcomes`
- * are ADDITIVE fields introduced by the F3 multi-builder fix. A single
- * ("N=1") run's `outcome`/`mergedBranch`/`seedStatus`/`breaker` shape is
- * byte-for-byte unchanged from before F3 — these two plural fields are
- * strictly new information layered on top, never a replacement for the
- * singular `mergedBranch`. A strict/versioned consumer can safely ignore
- * them; nothing existing changes meaning.
+ * are ADDITIVE fields introduced by the F3 multi-builder fix — a
+ * version-compatible schema extension, not a breaking change. Every field
+ * present before F3 (`outcome`/`mergedBranch`/`seedStatus`/`breaker`) keeps
+ * its prior meaning; the two plural fields are strictly new information
+ * layered on top, never a replacement for the singular `mergedBranch`, and a
+ * pre-F3 consumer can safely ignore them. (A single "N=1" run additionally
+ * populates `mergedBranches`/`builderOutcomes` — additive-only, so this is
+ * not a byte-for-byte-identical payload to pre-F3, but it is fully
+ * backward-compatible.)
  */
 export interface DriveResult {
 	outcome: DriveOutcome;
@@ -202,7 +243,7 @@ export interface DriveDeps {
 	runTurnFn?: TurnRunnerFn;
 	mergeBranchFn?: (
 		branch: string,
-		opts?: { dryRun?: boolean; into?: string },
+		opts?: { dryRun?: boolean; into?: string; sourceCommit?: string },
 	) => Promise<MergeBranchResult>;
 	recordSessionFn?: (metrics: SessionMetrics) => void;
 	/**
@@ -263,50 +304,6 @@ async function getBranchHeadSha(repoRoot: string, branchName: string): Promise<s
 	if (exitCode !== 0) return null;
 	const sha = stdout.trim();
 	return sha === "" ? null : sha;
-}
-
-/**
- * Review-round TOCTOU fix (Direct Assessment finding): create (or
- * force-update) a throwaway branch ref pinned at an exact, already-verified
- * sha. Used immediately before the real merge so `mergeBranchFn` merges
- * EXACTLY the sha that was reviewed and re-verified, never whatever the
- * mutable source branch ref happens to point at by the time the merge
- * subprocess actually runs — closing the narrow window between the
- * pre-merge sha re-check and the merge call itself. `mergeBranch`'s own
- * queue/branch-existence machinery requires a real `refs/heads/<name>`, so a
- * raw sha cannot be passed directly (see `merge.ts`) — pinning a dedicated
- * ref is the minimal way to make the merge target immutable without
- * touching `merge.ts`.
- */
-async function pinRefAtSha(repoRoot: string, refName: string, sha: string): Promise<void> {
-	const proc = Bun.spawn(["git", "update-ref", `refs/heads/${refName}`, sha], {
-		cwd: repoRoot,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
-	if (exitCode !== 0) {
-		throw new AgentError(`failed to pin throwaway ref "${refName}" at ${sha}: ${stderr.trim()}`);
-	}
-}
-
-/**
- * Best-effort cleanup counterpart to {@link pinRefAtSha}. Never throws —
- * this always runs from a `finally` block and a failure to delete a
- * throwaway ref must never mask the real merge outcome.
- */
-async function deletePinnedRef(repoRoot: string, refName: string): Promise<void> {
-	try {
-		const proc = Bun.spawn(["git", "branch", "-D", refName], {
-			cwd: repoRoot,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		await proc.exited;
-	} catch {
-		// Non-fatal: a leaked throwaway ref is harmless (never merged into,
-		// never a real builder/reviewer target) and must not mask the outcome.
-	}
 }
 
 /**
@@ -499,7 +496,10 @@ export async function driveCommand(
 
 	/** One builder branch's own (non-breaker) outcome from `reviewAndMergeBranch`. */
 	type BranchResult = {
-		kind: Exclude<DriveOutcome, "breaker" | "merged_partial" | "integration_failed">;
+		kind: Exclude<
+			DriveOutcome,
+			"breaker" | "merged_partial" | "integration_failed" | "integration_unverified"
+		>;
 		branch: string;
 		agentName: string;
 		tier: ResolutionTier | null;
@@ -609,6 +609,53 @@ export async function driveCommand(
 			return issue.status;
 		} catch {
 			return "unknown";
+		}
+	};
+
+	/**
+	 * Round-2 HIGH-1 fix: the SHARED, VERIFIED reopen path for every INCOMPLETE
+	 * outcome that must leave the seed workable (`merged_partial`,
+	 * `integration_failed`, `integration_unverified`).
+	 *
+	 * A real builder/lead closes its OWN seed task as part of its completion
+	 * protocol (see CRITICAL-1) BEFORE this driver reaches an incomplete-outcome
+	 * decision, so the seed may already be terminal even though this run's own
+	 * outcome is not a success. `claim()` is the tracker's "mark in_progress"
+	 * (workable, non-terminal) op — the same call a real builder uses, and the
+	 * one both the seeds and beads adapters implement — so it is the natural
+	 * ensure-workable operation.
+	 *
+	 * This is deliberately NOT described as a hard guarantee: if the backend
+	 * refuses the transition (or is unavailable) the seed can remain terminal.
+	 * So the claim is best-effort, the resulting status is READ BACK and
+	 * VERIFIED, and a still-terminal result is surfaced as a diagnostic rather
+	 * than silently asserted as "reopened". The DriveResult's own `seedStatus`
+	 * (via `resolveSeedStatus` at `finish`) always reports the tracker's real
+	 * resulting state regardless of whether the reopen actually took.
+	 */
+	const ensureSeedWorkable = async (context: string): Promise<void> => {
+		if (!config.taskTracker.enabled) return;
+		try {
+			await tracker.claim(seedId);
+		} catch {
+			// Best-effort: a hard failure is caught by the read-back+verify below;
+			// resolveSeedStatus reports the tracker's real state at finish() either way.
+		}
+		let status: string | null = null;
+		try {
+			status = (await tracker.show(seedId)).status;
+		} catch {
+			status = null;
+		}
+		if (status === null || !isWorkableSeedStatus(status)) {
+			try {
+				process.stderr.write(
+					`ov drive: could not return seed ${seedId} to a workable state after ${context} ` +
+						`(status: ${status ?? "unknown"}); reported seedStatus reflects the tracker's real state\n`,
+				);
+			} catch {
+				// Non-fatal: diagnostic output must not mask the real outcome.
+			}
 		}
 	};
 
@@ -1041,41 +1088,21 @@ export async function driveCommand(
 				return asFailed();
 			}
 
-			// Review-round TOCTOU fix (Direct Assessment finding, was finding G's
-			// "documented residual gap, no code change" above): a narrow window
+			// Review-round TOCTOU fix (round-2 pin-ref redesign): a narrow window
 			// still existed between the sha re-check immediately above and
 			// `mergeBranchFn(...)` actually landing the merge below — nothing in
 			// this single-process, lease-free driver prevents another writer from
-			// advancing the mutable `branch` ref in that small gap, and
-			// `mergeBranchFn(branch)` always resolves the branch NAME fresh, not
-			// the sha this driver just verified. Close it by pinning a throwaway
-			// ref at exactly `reviewedSha` (already re-verified as the branch's
-			// current tip one line above) and merging THAT immutable ref instead
-			// of the mutable branch name — a ref advancing after this point can no
-			// longer change what gets merged. `mergeBranchFn`'s own MergeQueue
-			// entry is keyed by branch NAME, so the pinned ref must be passed
-			// through and the resulting queue entry/branch bookkeeping cleaned up
-			// (`deletePinnedRef` in `finally`) regardless of outcome.
-			//
-			// Documented trade-off: because no queue entry already exists under
-			// `pinnedRefName` (the dry-run predict call above enqueued one under
-			// the real `branch` name, not this one-off ref), `mergeBranch` builds
-			// a FRESH entry for it and derives `agentName`/`taskId` from the ref
-			// name via its own `overstory/{agentName}/{taskId}` convention parser
-			// — which `ov-drive-pin/...` never matches, so that entry's
-			// agent/task metadata is cosmetically "unknown" regardless of the
-			// real branch's naming. This does not affect this driver's own
-			// `DriveResult`/`BranchResult` (which always use the real `branch`
-			// and `agentName` captured above, never `realResult.entry`), only the
-			// merge-queue's own internal bookkeeping for this one throwaway entry.
-			const pinnedRefName = `ov-drive-pin/${branch}`;
-			let realResult: MergeBranchResult;
-			try {
-				await pinRefAtSha(config.project.root, pinnedRefName, reviewedSha);
-				realResult = await mergeBranchFn(pinnedRefName);
-			} finally {
-				await deletePinnedRef(config.project.root, pinnedRefName);
-			}
+			// advancing the mutable `branch` ref in that small gap. Close it by
+			// passing the exact, already-re-verified `reviewedSha` as
+			// `sourceCommit`: `mergeBranch` keeps ALL queue/branch bookkeeping
+			// keyed on the real `branch` name (one row, correct agent/task
+			// identity, transitions pending -> merged) but hands the resolver the
+			// exact sha to merge, so the resolver runs `git merge <reviewedSha>`
+			// and a ref advancing after this point can no longer change what gets
+			// merged. No throwaway ref is created, so no named ref is ever
+			// force-updated or deleted, and no second/leaked queue identity
+			// appears (round-2 merge-gate items 2 + 3).
+			const realResult = await mergeBranchFn(branch, { sourceCommit: reviewedSha });
 			if (realResult.outcome === "conflict") {
 				return { kind: "merge_blocked", branch, agentName, tier: null };
 			}
@@ -1153,11 +1180,27 @@ export async function driveCommand(
 					// treating "we could not check" as "it's fine".
 					gateOutcome = { status: "failure", results: [], totalDurationMs: 0 };
 				}
-				if (gateOutcome && gateOutcome.status !== "success") {
-					// Do NOT close the seed here (left open, matching
-					// "merged_partial"'s treatment below) -- the combined result
-					// is unverified/broken even though every individual branch
-					// merged cleanly, so the task is not actually done.
+				// Round-2 HIGH-3 fail-closed fix: a `null` result means NO combined
+				// verification actually ran -- `runQualityGates` returns null for an
+				// empty gate list (an explicit `qualityGates: []`), so the integrated
+				// N>1 build is UNVERIFIED. Silently falling through to "merged" here
+				// was the fail-open the review flagged. Report the distinct,
+				// non-success `integration_unverified` instead, and leave the seed
+				// workable (same treatment as integration_failed / merged_partial).
+				if (gateOutcome === null) {
+					await ensureSeedWorkable("integration_unverified");
+					return await finish("integration_unverified", {
+						mergedBranch: mergedBranchNames[0],
+						mergedBranches: mergedBranchNames,
+						builderOutcomes,
+					});
+				}
+				if (gateOutcome.status !== "success") {
+					// The combined build is unverified/broken even though every
+					// individual branch merged cleanly, so the task is not actually
+					// done. Leave the seed workable (verified reopen) rather than
+					// closing it.
+					await ensureSeedWorkable("integration_failed");
 					return await finish("integration_failed", {
 						mergedBranch: mergedBranchNames[0],
 						mergedBranches: mergedBranchNames,
@@ -1195,31 +1238,21 @@ export async function driveCommand(
 		if (mergedResults.length > 0) {
 			// F3 fix: SOME builder branches merged, some did not — an honest
 			// partial outcome, deliberately NOT reported as "merged". The seed is
-			// left OPEN here (unlike the all-merged branch above): the task is
-			// genuinely incomplete, and `finish()`'s own run-completion mapping
-			// marks the run itself as not "completed" for this outcome too.
+			// left WORKABLE here (unlike the all-merged branch above): the task
+			// is genuinely incomplete, and `finish()`'s own run-completion
+			// mapping marks the run itself as not "completed" for this outcome.
 			//
-			// Review-round HIGH-1 fix: "left open" must be an actual guarantee,
-			// not just "we didn't call close()". A real builder/lead can (and,
-			// per this driver's own CRITICAL-1 handling, is explicitly allowed
-			// to) close its OWN seed task as part of its completion protocol
-			// BEFORE this driver ever reaches this point -- so the seed may
-			// already be sitting "closed" from the builder's own side effect
-			// even though this run's own outcome is only a partial merge.
-			// `TrackerClient` has no dedicated reopen operation, so best-effort
-			// re-claim it (the same call a real builder uses to mark an issue
-			// "in_progress" / open) -- non-fatal, matching every other
-			// tracker-mutation call site in this file: `finish()`'s
-			// `resolveSeedStatus()` reads the tracker's ACTUAL resulting status
-			// fresh regardless of whether this call itself succeeds.
-			if (config.taskTracker.enabled) {
-				try {
-					await tracker.claim(seedId);
-				} catch {
-					// Non-fatal: best-effort reopen must not mask the real outcome;
-					// finish()'s resolveSeedStatus() reports the truth either way.
-				}
-			}
+			// Round-2 HIGH-1 fix: "left workable" is a VERIFIED reopen via the
+			// SAME shared `ensureSeedWorkable` path as
+			// integration_failed/integration_unverified — not just "we didn't
+			// call close()". A real builder/lead can (per CRITICAL-1) close its
+			// OWN seed task as part of its completion protocol BEFORE this driver
+			// reaches here, so the seed may already be terminal even though this
+			// run's outcome is only partial; `ensureSeedWorkable` best-effort
+			// re-claims it (the tracker's "mark in_progress" op — both adapters),
+			// reads the status back, and surfaces a diagnostic if it stays
+			// terminal. The reopen is not asserted as a hard guarantee.
+			await ensureSeedWorkable("merged_partial");
 			return await finish("merged_partial", {
 				mergedBranch: mergedBranchNames[0],
 				mergedBranches: mergedBranchNames,
@@ -1286,12 +1319,29 @@ export async function driveCommand(
 	}
 }
 
+/**
+ * The process exit code `ov drive` sets for a given terminal outcome. ONLY
+ * `"merged"` (full success) and `"no_op"` (nothing to do — e.g. `--no-merge`,
+ * or no builder branch produced) exit `0`; every other outcome, including the
+ * incomplete-but-not-error `"merged_partial"` / `"integration_failed"` /
+ * `"integration_unverified"`, exits non-zero so a CI/headless caller treats a
+ * partial/unverified/failed drive as a failure.
+ *
+ * Extracted (round-2 finding-2/3 coverage) so the exit-code contract is unit
+ * testable without the Commander action's un-injectable `driveCommand(seedId,
+ * opts)` call (the action can't take fake spawn/tracker deps). The action below
+ * is the sole production caller.
+ */
+export function driveExitCode(outcome: DriveOutcome): 0 | 1 {
+	return outcome === "merged" || outcome === "no_op" ? 0 : 1;
+}
+
 /** Create the Commander command for `ov drive`. */
 export function createDriveCommand(): Command {
 	return new Command("drive")
 		.description(
 			"Headless run-to-completion: seed a top agent, drive mail until quiescent, " +
-				"reconcile+review+merge once, close the seed. SOLE-SUPERVISOR ASSUMPTION: do not " +
+				"then review+merge EVERY builder branch the run produced, close the seed. SOLE-SUPERVISOR ASSUMPTION: do not " +
 				"run `ov serve` or another `ov drive` against the same run concurrently (no cross-process lease). " +
 				"Requires every driven agent to be spawn-per-turn (headless); a non-headless/legacy " +
 				"descendant fails the run fast with a clear error.",
@@ -1329,9 +1379,7 @@ export function createDriveCommand(): Command {
 						);
 					}
 				}
-				if (result.outcome !== "merged" && result.outcome !== "no_op") {
-					process.exitCode = 1;
-				}
+				process.exitCode = driveExitCode(result.outcome);
 			} catch (err: unknown) {
 				const msg = err instanceof Error ? err.message : String(err);
 				if (opts.json) {

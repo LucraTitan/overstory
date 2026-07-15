@@ -163,6 +163,18 @@ async function safePredictForEntry(
 export interface MergeBranchOpts {
 	dryRun?: boolean;
 	into?: string;
+	/**
+	 * Exact commit-ish to merge, decoupled from `branchName`'s logical identity.
+	 * When set, the merge-queue entry, agent/task attribution, and display all
+	 * stay keyed on the real `branchName`, but the resolver merges EXACTLY this
+	 * commit (via the resolver's `mergeSource` seam) instead of the mutable
+	 * branch ref. Used by `ov drive` to land the precise reviewed sha even if
+	 * the branch advances after review — replacing the previous throwaway-ref
+	 * approach, so no named ref is ever force-updated/deleted and no second
+	 * queue identity is created. Ignored on the dry-run path (prediction reads
+	 * the branch). Not exposed on the CLI (`ov merge` has no such flag).
+	 */
+	sourceCommit?: string;
 }
 
 /**
@@ -247,25 +259,40 @@ export async function mergeBranch(
 		const allEntries = queue.list();
 		let entry = allEntries.find((e) => e.branchName === branchName) ?? null;
 
-		// If not in queue, create one by detecting info from the branch
+		// If not in queue, create one by detecting info from the branch.
 		if (entry === null) {
-			// Validate that the branch exists before attempting any git operations
-			const verifyProc = Bun.spawn(["git", "rev-parse", "--verify", `refs/heads/${branchName}`], {
+			// Validate that the branch — or, when an exact `sourceCommit` is given,
+			// that commit — exists before attempting any git operations. Either
+			// way the entry's identity/agent/task stay keyed on the logical
+			// `branchName`; only the diff base and the merge target commit change.
+			const verifyTarget = opts.sourceCommit
+				? `${opts.sourceCommit}^{commit}`
+				: `refs/heads/${branchName}`;
+			const verifyProc = Bun.spawn(["git", "rev-parse", "--verify", verifyTarget], {
 				cwd: repoRoot,
 				stdout: "pipe",
 				stderr: "pipe",
 			});
 			const verifyExit = await verifyProc.exited;
 			if (verifyExit !== 0) {
-				throw new ValidationError(`Branch "${branchName}" not found`, {
-					field: "branch",
-					value: branchName,
-				});
+				throw new ValidationError(
+					opts.sourceCommit
+						? `Source commit "${opts.sourceCommit}" not found`
+						: `Branch "${branchName}" not found`,
+					{
+						field: opts.sourceCommit ? "sourceCommit" : "branch",
+						value: opts.sourceCommit ?? branchName,
+					},
+				);
 			}
 
 			const agentName = parseAgentName(branchName);
 			const taskId = parseTaskId(branchName);
-			const filesModified = await detectModifiedFiles(repoRoot, targetBranch, branchName);
+			const filesModified = await detectModifiedFiles(
+				repoRoot,
+				targetBranch,
+				opts.sourceCommit ?? branchName,
+			);
 
 			entry = queue.enqueue({
 				branchName,
@@ -287,8 +314,10 @@ export async function mergeBranch(
 			};
 		}
 
-		// Perform the actual merge
-		const result = await resolver.resolve(entry, targetBranch, repoRoot);
+		// Perform the actual merge. When an exact `sourceCommit` is supplied the
+		// resolver merges precisely that commit while keeping every queue/branch
+		// bookkeeping identity keyed on the real `branchName` (see MergeBranchOpts).
+		const result = await resolver.resolve(entry, targetBranch, repoRoot, opts.sourceCommit);
 
 		// Update queue status based on result
 		queue.updateStatus(branchName, result.success ? "merged" : "conflict", result.tier);

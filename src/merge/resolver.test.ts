@@ -1776,7 +1776,11 @@ describe("createMergeResolver", () => {
 				const selectiveMock = (...args: unknown[]): unknown => {
 					const cmd = args[0] as string[];
 					if (cmd?.[0] === "claude") {
-						capturedPrompt = cmd[3] ?? "";
+						// The prompt is the argument after `-p` (the print runtime prepends
+						// flags like `--setting-sources`/`--disable-slash-commands`, so a
+						// fixed index is brittle). Locate it by the flag instead.
+						const pIdx = cmd.indexOf("-p");
+						capturedPrompt = (pIdx >= 0 ? cmd[pIdx + 1] : undefined) ?? "";
 						return mockSpawnResult("resolved content\n", "", 0);
 					}
 					return originalSpawn.apply(Bun, args as Parameters<typeof Bun.spawn>);

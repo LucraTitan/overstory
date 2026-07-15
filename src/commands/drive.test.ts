@@ -1,18 +1,21 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TurnRunnerFn } from "../agents/headless-mail-injector.ts";
 import type { TurnSpawnFn, TurnSubprocess } from "../agents/turn-runner.ts";
 import { ValidationError } from "../errors.ts";
 import { createMailClient } from "../mail/client.ts";
 import { createMailStore } from "../mail/store.ts";
+import { createMergeQueue } from "../merge/queue.ts";
 import { createMetricsStore } from "../metrics/store.ts";
 import { openSessionStore } from "../sessions/compat.ts";
 import { cleanupTempDir, createTempGitRepo, runGitInDir } from "../test-helpers.ts";
+import { createSeedsTracker } from "../tracker/seeds.ts";
 import type { TrackerClient, TrackerIssue } from "../tracker/types.ts";
 import type { SessionMetrics } from "../types.ts";
-import { driveCommand } from "./drive.ts";
+import { type DriveOutcome, driveCommand, driveExitCode } from "./drive.ts";
 import type { Spawner } from "./init.ts";
 import { initCommand } from "./init.ts";
 import type { MergeBranchResult } from "./merge.ts";
@@ -394,14 +397,15 @@ function makeFakeTracker(overrides: Partial<TrackerClient> = {}): {
 		async create(): Promise<string> {
 			return "unused";
 		},
-		// Review-round HIGH-1 fix: `driveCommand`'s `merged_partial` path
-		// best-effort re-claims the seed to guarantee it ends up open even if
-		// a builder already closed it (`TrackerClient` has no dedicated
-		// reopen op — `claim()` is the real seeds/beads "mark in_progress /
-		// open" call). Model that same reopen effect here so tests can prove
-		// it actually flips a pre-closed seed back to "open".
+		// Round-2 HIGH-1 fix: production fidelity. Both the seeds and beads
+		// adapters implement `claim()` as `update <id> --status in_progress`
+		// (verified against the real sd 0.5.14 CLI: claiming a CLOSED issue
+		// yields `status: "in_progress"`, NOT literal "open"). `ov drive`'s
+		// `ensureSeedWorkable` reopen path reuses `claim()`, so model the REAL
+		// resulting status here — a workable, non-terminal `in_progress` — not
+		// the previous fiction of literal "open".
 		async claim(id: string): Promise<void> {
-			statusById.set(id, "open");
+			statusById.set(id, "in_progress");
 		},
 		async close(id: string): Promise<void> {
 			closedIds.push(id);
@@ -414,6 +418,42 @@ function makeFakeTracker(overrides: Partial<TrackerClient> = {}): {
 		...overrides,
 	};
 	return { tracker, closedIds, statusById };
+}
+
+/** Whether the real `sd` (seeds) CLI is on PATH — gates the production-fidelity seeds tests. */
+const HAS_SD = Bun.which("sd") !== null;
+
+/**
+ * A forced merge-BLOCKED `MergeBranchResult` (predicted tier above auto),
+ * matching the fixture shape the pre-existing merge_blocked tests use. Lets a
+ * multi-builder test drive a specific branch to `merge_blocked` while the
+ * others merge for real via the real `mergeBranch` service.
+ */
+function makeMergeBlockedResult(
+	branch: string,
+	taskId: string,
+	agentName: string,
+): MergeBranchResult {
+	return {
+		outcome: "noop",
+		branch,
+		tier: "ai-resolve",
+		entry: {
+			branchName: branch,
+			taskId,
+			agentName,
+			filesModified: ["drive-output-2.txt"],
+			enqueuedAt: new Date().toISOString(),
+			status: "pending",
+			resolvedTier: null,
+		},
+		prediction: {
+			predictedTier: "ai-resolve",
+			conflictFiles: ["drive-output-2.txt"],
+			wouldRequireAgent: true,
+			reason: "forced-for-test",
+		},
+	};
 }
 
 // ---------- test suite ----------
@@ -645,7 +685,7 @@ describe("driveCommand", () => {
 		expect(capturedReviewerStdin).toContain("SEND THIS MAIL UNCONDITIONALLY");
 	});
 
-	test("review FAIL -> outcome 'review_failed', nothing merged, seed left open", async () => {
+	test("review FAIL -> outcome 'review_failed', nothing merged, seed left workable (in_progress)", async () => {
 		const overstoryDir = join(tempDir, ".overstory");
 		const { tracker, closedIds } = makeFakeTracker();
 		const _spawnFn = makeFakeSpawn({ overstoryDir, reviewVerdict: "FAIL" });
@@ -654,7 +694,7 @@ describe("driveCommand", () => {
 
 		expect(result.outcome).toBe("review_failed");
 		expect(result.mergedBranch).toBeUndefined();
-		expect(result.seedStatus).toBe("open");
+		expect(result.seedStatus).toBe("in_progress");
 		expect(closedIds).toEqual([]);
 		expect(await Bun.file(join(tempDir, "drive-output.txt")).exists()).toBe(false);
 	});
@@ -672,7 +712,7 @@ describe("driveCommand", () => {
 
 		expect(result.outcome).toBe("no_op");
 		expect(result.mergedBranch).toBeUndefined();
-		expect(result.seedStatus).toBe("open");
+		expect(result.seedStatus).toBe("in_progress");
 		expect(closedIds).toEqual([]);
 		expect(await Bun.file(join(tempDir, "drive-output.txt")).exists()).toBe(false);
 	});
@@ -716,7 +756,7 @@ describe("driveCommand", () => {
 
 		expect(result.outcome).toBe("merge_blocked");
 		expect(result.mergedBranch).toBeUndefined();
-		expect(result.seedStatus).toBe("open");
+		expect(result.seedStatus).toBe("in_progress");
 		expect(closedIds).toEqual([]);
 	});
 
@@ -1393,7 +1433,7 @@ describe("driveCommand", () => {
 		expect(await Bun.file(join(tempDir, "drive-output-2.txt")).exists()).toBe(true);
 	});
 
-	test("F3 fix: a run with TWO builder branches -- second is merge-blocked -> outcome 'merged_partial', seed left open, first branch still merged", async () => {
+	test("F3 fix: a run with TWO builder branches -- second is merge-blocked -> outcome 'merged_partial', seed left workable, first branch still merged", async () => {
 		const overstoryDir = join(tempDir, ".overstory");
 		const { tracker, closedIds } = makeFakeTracker();
 		const topAgentName = "builder-seed-multi-b";
@@ -1476,7 +1516,7 @@ describe("driveCommand", () => {
 
 		// "merged_partial" is NOT a success outcome (F3 fix): the seed stays
 		// open (unlike a full "merged") and nothing was closed.
-		expect(result.seedStatus).toBe("open");
+		expect(result.seedStatus).toBe("in_progress");
 		expect(closedIds).toEqual([]);
 
 		// The first branch's work landed; the blocked second branch's did not.
@@ -1484,7 +1524,7 @@ describe("driveCommand", () => {
 		expect(await Bun.file(join(tempDir, "drive-output-2.txt")).exists()).toBe(false);
 	});
 
-	test("HIGH-1: 'merged_partial' guarantees the seed ends OPEN even if the builder pre-closed it", async () => {
+	test("HIGH-1: 'merged_partial' returns the seed to a workable (non-terminal) state even if the builder pre-closed it", async () => {
 		const overstoryDir = join(tempDir, ".overstory");
 		const { tracker, statusById } = makeFakeTracker();
 		const topAgentName = "builder-seed-multi-e";
@@ -1561,11 +1601,13 @@ describe("driveCommand", () => {
 
 		expect(result.outcome).toBe("merged_partial");
 		// Pre-fix, this path only ever AVOIDED calling close() -- it never
-		// guaranteed the seed was actually open, so a builder's own pre-close
+		// returned the seed to a workable state, so a builder's own pre-close
 		// side effect would leak through as `seedStatus: "closed"` even on a
-		// genuinely incomplete run. Post-fix, the driver best-effort re-claims
-		// the seed on this path, flipping it back to open.
-		expect(result.seedStatus).toBe("open");
+		// genuinely incomplete run. Post-fix, the shared `ensureSeedWorkable`
+		// path best-effort re-claims the seed (the tracker's real "mark
+		// in_progress" op) and verifies it, flipping the pre-closed seed back to
+		// the workable, non-terminal `in_progress` status.
+		expect(result.seedStatus).toBe("in_progress");
 	});
 
 	test("HIGH-2: multi-builder --no-merge with a genuine review failure on another branch does NOT collapse to 'no_op'", async () => {
@@ -1703,7 +1745,7 @@ describe("driveCommand", () => {
 		expect(result.builderOutcomes?.every((b) => b.outcome === "merged")).toBe(true);
 		// Not a success outcome (same treatment as "merged_partial"): seed
 		// stays open, nothing gets closed.
-		expect(result.seedStatus).toBe("open");
+		expect(result.seedStatus).toBe("in_progress");
 		expect(closedIds).toEqual([]);
 		// Both branches' work still actually landed on the canonical checkout
 		// -- this outcome reports the combined build as broken, it does not
@@ -1836,6 +1878,503 @@ describe("driveCommand", () => {
 		expect(result.mergedBranches?.[0]).toBe(secondBranch);
 		expect(result.mergedBranches?.[1]).not.toBe(secondBranch);
 	});
+
+	// ---- round-2 merge-gate strengthening tests ----
+
+	/**
+	 * Shared clean-2-builder setup: the top ("builder") agent commits, spawns a
+	 * synthesized second builder with its own real committed branch, then both
+	 * send terminal mail. `onCommitExtra` runs inside the (synchronous) builder
+	 * commit hook for tests that need an extra side effect (e.g. closing a real
+	 * seed mid-run). Mirrors the pre-existing multi-builder tests' pattern.
+	 */
+	const twoBuilderSpawn = (opts: {
+		overstoryDir: string;
+		seedId: string;
+		secondAgentName: string;
+		secondBranch: string;
+		secondTaskId: string;
+		onCommitExtra?: () => void;
+	}): TurnSpawnFn =>
+		makeFakeSpawn({
+			overstoryDir: opts.overstoryDir,
+			onBuilderCommit: () => {
+				opts.onCommitExtra?.();
+				const { store } = openSessionStore(opts.overstoryDir);
+				let top: ReturnType<typeof store.getByName>;
+				try {
+					top = store.getByName(`builder-${opts.seedId}`);
+				} finally {
+					store.close();
+				}
+				if (!top) throw new Error(`top agent session missing for ${opts.seedId}`);
+				insertSecondBuilderSync({
+					tempDir,
+					overstoryDir: opts.overstoryDir,
+					runId: top.runId ?? "",
+					parentAgent: top.agentName,
+					depth: top.depth + 1,
+					taskId: opts.secondTaskId,
+					agentName: opts.secondAgentName,
+					branchName: opts.secondBranch,
+				});
+			},
+		});
+
+	test("round-2 HIGH-3: a combined-gate run returning null (no gates ran) -> 'integration_unverified', NOT 'merged'", async () => {
+		const overstoryDir = join(tempDir, ".overstory");
+		const { tracker, closedIds } = makeFakeTracker();
+		const _spawnFn = twoBuilderSpawn({
+			overstoryDir,
+			seedId: "seed-unverified-null",
+			secondAgentName: "fake-builder-2u",
+			secondBranch: "fake-builder2u-branch",
+			secondTaskId: "seed-unverified-null-part2",
+		});
+		// A null gate result means NO combined verification actually ran. The
+		// integrated build is UNVERIFIED, so it must NOT be reported as success.
+		const nullGates = async () => null;
+
+		const result = await driveCommand(
+			"seed-unverified-null",
+			{ capability: "builder" },
+			{ _spawnFn, tracker, runQualityGatesFn: nullGates },
+		);
+
+		expect(result.outcome).toBe("integration_unverified");
+		expect(result.outcome).not.toBe("merged");
+		expect(driveExitCode(result.outcome)).toBe(1);
+		expect(result.mergedBranches?.length).toBe(2);
+		expect(result.builderOutcomes?.every((b) => b.outcome === "merged")).toBe(true);
+		// Not a success outcome: seed left workable, nothing closed.
+		expect(result.seedStatus).toBe("in_progress");
+		expect(closedIds).toEqual([]);
+		// Both branches still actually landed on canonical.
+		expect(await Bun.file(join(tempDir, "drive-output.txt")).exists()).toBe(true);
+		expect(await Bun.file(join(tempDir, "drive-output-2.txt")).exists()).toBe(true);
+	});
+
+	test("round-2 HIGH-3: an explicit empty qualityGates ([]) runs the REAL gate runner, gets null, and fails closed to 'integration_unverified'", async () => {
+		const overstoryDir = join(tempDir, ".overstory");
+		// Explicit empty gate list is permitted by config validation; the real
+		// `runQualityGates` returns null for it. No `runQualityGatesFn` injected,
+		// so the production gate runner actually runs.
+		writeFileSync(join(overstoryDir, "config.local.yaml"), "project:\n  qualityGates: []\n");
+		const { tracker, closedIds } = makeFakeTracker();
+		const _spawnFn = twoBuilderSpawn({
+			overstoryDir,
+			seedId: "seed-unverified-empty",
+			secondAgentName: "fake-builder-2ue",
+			secondBranch: "fake-builder2ue-branch",
+			secondTaskId: "seed-unverified-empty-part2",
+		});
+
+		const result = await driveCommand(
+			"seed-unverified-empty",
+			{ capability: "builder" },
+			{ _spawnFn, tracker },
+		);
+
+		expect(result.outcome).toBe("integration_unverified");
+		expect(driveExitCode(result.outcome)).toBe(1);
+		expect(result.mergedBranches?.length).toBe(2);
+		expect(closedIds).toEqual([]);
+	});
+
+	test("round-2 HIGH-3: a REAL configured gate command runs against the combined checkout and fails -> 'integration_failed'", async () => {
+		const overstoryDir = join(tempDir, ".overstory");
+		const gateMarker = join(tempDir, "integration-gate-ran.marker");
+		const gateScript = join(tempDir, "integration-gate.sh");
+		// Real, production-fidelity gate: exits 0 when either builder output is
+		// present alone, exits non-zero ONLY when BOTH incompatible changes are
+		// present together. Appends to a marker so the test proves the real
+		// command actually executed (not a stub).
+		writeFileSync(
+			gateScript,
+			`#!/bin/sh\necho ran >> "${gateMarker}"\nif [ -f drive-output.txt ] && [ -f drive-output-2.txt ]; then exit 1; fi\nexit 0\n`,
+		);
+		writeFileSync(
+			join(overstoryDir, "config.local.yaml"),
+			`project:\n  qualityGates:\n    - name: integration-gate\n      command: sh ${gateScript}\n      description: fails only when both incompatible branches are present\n`,
+		);
+		const { tracker, closedIds } = makeFakeTracker();
+		// NO runQualityGatesFn injection: the REAL runQualityGates spawns the
+		// configured `sh <script>` command against the canonical checkout.
+		const _spawnFn = twoBuilderSpawn({
+			overstoryDir,
+			seedId: "seed-realgate",
+			secondAgentName: "fake-builder-2rg",
+			secondBranch: "fake-builder2rg-branch",
+			secondTaskId: "seed-realgate-part2",
+		});
+
+		const result = await driveCommand(
+			"seed-realgate",
+			{ capability: "builder" },
+			{ _spawnFn, tracker },
+		);
+
+		// The real gate command actually ran against canonical...
+		expect(await Bun.file(gateMarker).exists()).toBe(true);
+		// ...and with both incompatible outputs present, it failed -> integration_failed.
+		expect(result.outcome).toBe("integration_failed");
+		expect(driveExitCode(result.outcome)).toBe(1);
+		expect(result.mergedBranches?.length).toBe(2);
+		expect(result.builderOutcomes?.every((b) => b.outcome === "merged")).toBe(true);
+		expect(result.seedStatus).toBe("in_progress");
+		expect(closedIds).toEqual([]);
+		expect(await Bun.file(join(tempDir, "drive-output.txt")).exists()).toBe(true);
+		expect(await Bun.file(join(tempDir, "drive-output-2.txt")).exists()).toBe(true);
+	});
+
+	test("round-2 HIGH-3: a combined-gate runner that THROWS fails closed -> 'integration_failed'", async () => {
+		const overstoryDir = join(tempDir, ".overstory");
+		const { tracker } = makeFakeTracker();
+		const _spawnFn = twoBuilderSpawn({
+			overstoryDir,
+			seedId: "seed-gatethrow",
+			secondAgentName: "fake-builder-2gt",
+			secondBranch: "fake-builder2gt-branch",
+			secondTaskId: "seed-gatethrow-part2",
+		});
+		const throwingGates = async () => {
+			throw new Error("gate runner crashed");
+		};
+
+		const result = await driveCommand(
+			"seed-gatethrow",
+			{ capability: "builder" },
+			{ _spawnFn, tracker, runQualityGatesFn: throwingGates },
+		);
+
+		expect(result.outcome).toBe("integration_failed");
+		expect(result.seedStatus).toBe("in_progress");
+	});
+
+	test("round-2 HIGH-3: a combined-gate 'partial' status is not success -> 'integration_failed'", async () => {
+		const overstoryDir = join(tempDir, ".overstory");
+		const { tracker } = makeFakeTracker();
+		const _spawnFn = twoBuilderSpawn({
+			overstoryDir,
+			seedId: "seed-gatepartial",
+			secondAgentName: "fake-builder-2gp",
+			secondBranch: "fake-builder2gp-branch",
+			secondTaskId: "seed-gatepartial-part2",
+		});
+		const partialGates = async () => ({
+			status: "partial" as const,
+			results: [],
+			totalDurationMs: 1,
+		});
+
+		const result = await driveCommand(
+			"seed-gatepartial",
+			{ capability: "builder" },
+			{ _spawnFn, tracker, runQualityGatesFn: partialGates },
+		);
+
+		expect(result.outcome).toBe("integration_failed");
+		expect(result.seedStatus).toBe("in_progress");
+	});
+
+	test("round-2 HIGH-1: when reopen (claim) FAILS on a builder-preclosed seed, the run does NOT falsely report it workable", async () => {
+		const overstoryDir = join(tempDir, ".overstory");
+		const seedId = "seed-claimfail";
+		const secondBranch = "fake-builder2cf-branch";
+		const secondTaskId = "seed-claimfail-part2";
+		const secondAgentName = "fake-builder-2cf";
+		// Fake tracker whose claim ALWAYS throws (backend refuses the reopen).
+		const { tracker, statusById } = makeFakeTracker({
+			claim: async () => {
+				throw new Error("backend refused claim");
+			},
+		});
+		const _spawnFn = twoBuilderSpawn({
+			overstoryDir,
+			seedId,
+			secondAgentName,
+			secondBranch,
+			secondTaskId,
+			// Builder self-closes the seed as part of its completion protocol.
+			onCommitExtra: () => statusById.set(seedId, "closed"),
+		});
+		const partialMergeFn = async (
+			branch: string,
+			mergeOpts?: { dryRun?: boolean; into?: string; sourceCommit?: string },
+		): Promise<MergeBranchResult> => {
+			if (branch === secondBranch) {
+				return makeMergeBlockedResult(secondBranch, secondTaskId, secondAgentName);
+			}
+			return mergeBranch(branch, mergeOpts);
+		};
+
+		const result = await driveCommand(
+			seedId,
+			{ capability: "builder" },
+			{ _spawnFn, tracker, mergeBranchFn: partialMergeFn },
+		);
+
+		expect(result.outcome).toBe("merged_partial");
+		// The reopen genuinely failed; the run must NOT pretend the seed is
+		// workable. `seedStatus` reflects the tracker's real (still-closed) state
+		// rather than a fabricated "reopened" guarantee.
+		expect(result.seedStatus).toBe("closed");
+	});
+
+	test("round-2 MEDIUM-4: an exception on branch 2 after branch 1 already merged still discloses branch 1 via the outer catch", async () => {
+		const overstoryDir = join(tempDir, ".overstory");
+		const seedId = "seed-outerexc";
+		const secondBranch = "fake-builder2oe-branch";
+		const secondTaskId = "seed-outerexc-part2";
+		const { tracker, closedIds } = makeFakeTracker();
+		const _spawnFn = twoBuilderSpawn({
+			overstoryDir,
+			seedId,
+			secondAgentName: "fake-builder-2oe",
+			secondBranch,
+			secondTaskId,
+		});
+		// Branch 1 (the top builder) merges for real; branch 2's merge throws an
+		// unexpected exception, which must reach the OUTER catch — which still
+		// discloses branch 1's already-landed merge (canonical was modified).
+		const throwOnSecond = async (
+			branch: string,
+			mergeOpts?: { dryRun?: boolean; into?: string; sourceCommit?: string },
+		): Promise<MergeBranchResult> => {
+			if (branch === secondBranch) {
+				throw new Error("simulated merge outage on branch 2");
+			}
+			return mergeBranch(branch, mergeOpts);
+		};
+
+		const result = await driveCommand(
+			seedId,
+			{ capability: "builder" },
+			{ _spawnFn, tracker, mergeBranchFn: throwOnSecond },
+		);
+
+		expect(result.outcome).toBe("failed");
+		expect(result.mergedBranches?.length).toBe(1);
+		expect(result.mergedBranches?.[0]).not.toBe(secondBranch);
+		expect(result.builderOutcomes?.length).toBe(1);
+		expect(result.builderOutcomes?.[0]?.outcome).toBe("merged");
+		expect(closedIds).toEqual([]);
+		// Branch 1's work landed; branch 2 never did.
+		expect(await Bun.file(join(tempDir, "drive-output.txt")).exists()).toBe(true);
+		expect(await Bun.file(join(tempDir, "drive-output-2.txt")).exists()).toBe(false);
+	});
+
+	test("round-2 items 2+3: a successful drive merge keeps merge-queue identity on the real branch and leaves no throwaway pin ref/row", async () => {
+		const overstoryDir = join(tempDir, ".overstory");
+		const { tracker } = makeFakeTracker();
+		// Single-builder happy path via the REAL mergeBranch service (no
+		// injection) — exercises the real `sourceCommit` merge path end-to-end.
+		const _spawnFn = makeFakeSpawn({ overstoryDir });
+
+		const result = await driveCommand(
+			"seed-noleak",
+			{ capability: "builder" },
+			{ _spawnFn, tracker },
+		);
+
+		expect(result.outcome).toBe("merged");
+		const mergedBranch = result.mergedBranch;
+		expect(mergedBranch).toBeTruthy();
+
+		// Merge-queue: the real builder branch's row is 'merged'; NO throwaway
+		// 'ov-drive-pin/*' identity leaked (the round-1 pin approach created a
+		// separate 'unknown'-identity row that was never cleaned up).
+		const queue = createMergeQueue(join(overstoryDir, "merge-queue.db"));
+		let entries: ReturnType<typeof queue.list>;
+		try {
+			entries = queue.list();
+		} finally {
+			queue.close();
+		}
+		expect(entries.some((e) => e.branchName.startsWith("ov-drive-pin/"))).toBe(false);
+		const realEntry = entries.find((e) => e.branchName === mergedBranch);
+		expect(realEntry).toBeTruthy();
+		expect(realEntry?.status).toBe("merged");
+
+		// No throwaway pin ref remains in the repo (the round-1 approach created
+		// and then `git branch -D`'d a real `refs/heads/ov-drive-pin/<branch>`).
+		const refs = Bun.spawnSync(
+			["git", "for-each-ref", "--format=%(refname)", "refs/heads/ov-drive-pin"],
+			{ cwd: tempDir },
+		);
+		expect(new TextDecoder().decode(refs.stdout).trim()).toBe("");
+	});
+
+	test("round-2 item 2: the real merge is handed the reviewed sha via sourceCommit while queue identity stays on the real branch name", async () => {
+		const overstoryDir = join(tempDir, ".overstory");
+		const { tracker } = makeFakeTracker();
+		const _spawnFn = makeFakeSpawn({ overstoryDir });
+
+		let capturedBranch: string | undefined;
+		let capturedSourceCommit: string | undefined;
+		const recordingMergeFn = async (
+			branch: string,
+			mergeOpts?: { dryRun?: boolean; into?: string; sourceCommit?: string },
+		): Promise<MergeBranchResult> => {
+			// Let the real dry-run predict cleanly; capture only the real merge's args.
+			if (mergeOpts?.dryRun) {
+				return mergeBranch(branch, mergeOpts);
+			}
+			capturedBranch = branch;
+			capturedSourceCommit = mergeOpts?.sourceCommit;
+			// Report success WITHOUT actually merging — we only assert the arguments,
+			// so the branch tip stays at its reviewed sha for the comparison below.
+			return {
+				outcome: "merged",
+				branch,
+				tier: "clean-merge",
+				entry: {
+					branchName: branch,
+					taskId: "seed-sourcecommit",
+					agentName: "builder-seed-sourcecommit",
+					filesModified: ["drive-output.txt"],
+					enqueuedAt: new Date().toISOString(),
+					status: "merged",
+					resolvedTier: "clean-merge",
+				},
+			};
+		};
+
+		const result = await driveCommand(
+			"seed-sourcecommit",
+			{ capability: "builder" },
+			{ _spawnFn, tracker, mergeBranchFn: recordingMergeFn },
+		);
+
+		expect(result.outcome).toBe("merged");
+		// Queue identity stays on the REAL builder branch name (never a throwaway
+		// pin ref), and the merge was handed the exact reviewed HEAD sha as
+		// `sourceCommit` — not left to re-resolve the mutable branch name.
+		expect(capturedBranch).toBeTruthy();
+		expect(capturedBranch).not.toMatch(/^ov-drive-pin\//);
+		expect(capturedSourceCommit).toMatch(/^[0-9a-f]{40}$/);
+		const headSha = new TextDecoder()
+			.decode(
+				Bun.spawnSync(["git", "rev-parse", capturedBranch ?? "HEAD"], { cwd: tempDir }).stdout,
+			)
+			.trim();
+		expect(capturedSourceCommit).toBe(headSha);
+	});
+
+	test.skipIf(!HAS_SD)(
+		"round-2 HIGH-1 (production fidelity): a REAL seeds seed pre-closed mid-run by the builder is reopened to a workable status on 'merged_partial'",
+		async () => {
+			const overstoryDir = join(tempDir, ".overstory");
+			// Initialize a real seeds repo in the temp git repo and create an OPEN seed.
+			const initRes = Bun.spawnSync(["sd", "init"], { cwd: tempDir });
+			expect(initRes.exitCode).toBe(0);
+			const createRes = Bun.spawnSync(
+				["sd", "create", "--title", "real seed", "--type", "task", "--json"],
+				{ cwd: tempDir },
+			);
+			expect(createRes.exitCode).toBe(0);
+			const seedId = JSON.parse(new TextDecoder().decode(createRes.stdout)).id as string;
+			expect(seedId).toBeTruthy();
+
+			const secondBranch = "fake-builder2rs-branch";
+			const secondTaskId = `${seedId}-part2`;
+			const secondAgentName = "fake-builder-2rs";
+			const tracker = createSeedsTracker(tempDir);
+
+			const _spawnFn = twoBuilderSpawn({
+				overstoryDir,
+				seedId,
+				secondAgentName,
+				secondBranch,
+				secondTaskId,
+				// The builder closes its OWN real seed (real `sd close`) as part of
+				// its completion protocol, BEFORE ov drive's partial-outcome decision.
+				onCommitExtra: () => {
+					const closeRes = Bun.spawnSync(
+						["sd", "close", seedId, "--reason", "builder self-close"],
+						{ cwd: tempDir },
+					);
+					if (closeRes.exitCode !== 0) {
+						throw new Error(`sd close failed: ${new TextDecoder().decode(closeRes.stderr)}`);
+					}
+				},
+			});
+			const partialMergeFn = async (
+				branch: string,
+				mergeOpts?: { dryRun?: boolean; into?: string; sourceCommit?: string },
+			): Promise<MergeBranchResult> => {
+				if (branch === secondBranch) {
+					return makeMergeBlockedResult(secondBranch, secondTaskId, secondAgentName);
+				}
+				return mergeBranch(branch, mergeOpts);
+			};
+
+			const result = await driveCommand(
+				seedId,
+				{ capability: "builder" },
+				{ _spawnFn, tracker, mergeBranchFn: partialMergeFn },
+			);
+
+			expect(result.outcome).toBe("merged_partial");
+			// The REAL seeds seed, closed mid-run, is reopened to a workable status
+			// by the shared ensureSeedWorkable path (`sd update --status in_progress`).
+			const finalStatus = (await createSeedsTracker(tempDir).show(seedId)).status;
+			expect(finalStatus).not.toBe("closed");
+			expect(["in_progress", "open"]).toContain(finalStatus);
+			// The driver's own resolved seedStatus agrees with the real tracker.
+			expect(result.seedStatus).toBe(finalStatus);
+		},
+	);
+
+	test.skipIf(!HAS_SD)(
+		"round-2 HIGH-1/HIGH-3 (production fidelity): a REAL seeds seed pre-closed mid-run is reopened on 'integration_failed'",
+		async () => {
+			const overstoryDir = join(tempDir, ".overstory");
+			const initRes = Bun.spawnSync(["sd", "init"], { cwd: tempDir });
+			expect(initRes.exitCode).toBe(0);
+			const createRes = Bun.spawnSync(
+				["sd", "create", "--title", "real seed", "--type", "task", "--json"],
+				{ cwd: tempDir },
+			);
+			expect(createRes.exitCode).toBe(0);
+			const seedId = JSON.parse(new TextDecoder().decode(createRes.stdout)).id as string;
+
+			const tracker = createSeedsTracker(tempDir);
+			const _spawnFn = twoBuilderSpawn({
+				overstoryDir,
+				seedId,
+				secondAgentName: "fake-builder-2ri",
+				secondBranch: "fake-builder2ri-branch",
+				secondTaskId: `${seedId}-part2`,
+				onCommitExtra: () => {
+					const closeRes = Bun.spawnSync(
+						["sd", "close", seedId, "--reason", "builder self-close"],
+						{ cwd: tempDir },
+					);
+					if (closeRes.exitCode !== 0) {
+						throw new Error(`sd close failed: ${new TextDecoder().decode(closeRes.stderr)}`);
+					}
+				},
+			});
+			// Both branches merge for real, but the combined gate fails.
+			const failingGates = async () => ({
+				status: "failure" as const,
+				results: [],
+				totalDurationMs: 1,
+			});
+
+			const result = await driveCommand(
+				seedId,
+				{ capability: "builder" },
+				{ _spawnFn, tracker, runQualityGatesFn: failingGates },
+			);
+
+			expect(result.outcome).toBe("integration_failed");
+			const finalStatus = (await createSeedsTracker(tempDir).show(seedId)).status;
+			expect(finalStatus).not.toBe("closed");
+			expect(["in_progress", "open"]).toContain(finalStatus);
+		},
+	);
 });
 
 // Sanity: confirm the merged branch's commit is actually reachable from the
@@ -1876,5 +2415,88 @@ describe("driveCommand merge lands on canonical branch history", () => {
 		// git merge-base --is-ancestor <branch> HEAD exits 0 iff branch is an
 		// ancestor of (or equal to) the current HEAD (canonical checkout, main).
 		await runGitInDir(tempDir, ["merge-base", "--is-ancestor", branch, "HEAD"]);
+	});
+});
+
+// The exact process exit-code contract the `ov drive` CLI action applies, unit
+// tested directly (round-2 findings 2/3): the Commander action calls
+// `driveCommand(seedId, opts)` with no injectable deps, so the exit-code rule
+// is extracted to `driveExitCode` and asserted here without a live run.
+describe("driveExitCode", () => {
+	test("only 'merged' and 'no_op' exit 0; every incomplete/failed outcome exits 1", () => {
+		expect(driveExitCode("merged")).toBe(0);
+		expect(driveExitCode("no_op")).toBe(0);
+		const nonZero: DriveOutcome[] = [
+			"merged_partial",
+			"integration_failed",
+			"integration_unverified",
+			"review_failed",
+			"merge_blocked",
+			"breaker",
+			"failed",
+		];
+		for (const outcome of nonZero) {
+			expect(driveExitCode(outcome)).toBe(1);
+		}
+	});
+});
+
+// Production-fidelity contract coverage for the OTHER tracker backend (beads).
+// `bd` is frequently absent, so this stubs a CLI-level `bd` and exercises the
+// REAL `createBeadsClient` adapter, proving it maps the shared ensure-workable
+// `claim()` to `bd update <id> --status in_progress` exactly as the seeds
+// adapter does (the latter verified against the real sd CLI in the driveCommand
+// suite above).
+//
+// Bun resolves a bare-name spawn (`bd`) against a PATH SNAPSHOT taken at process
+// startup — mutating `process.env.PATH` in-process does NOT affect it. `runBd`
+// passes no explicit env, so the stub can only be reached by a CHILD bun process
+// launched with an explicit PATH (its own startup snapshot then includes the
+// stub dir). The child runs the actual adapter and prints the parsed status.
+describe("beads adapter reopen contract", () => {
+	test("claim() issues `bd update <id> --status in_progress` and show reflects the production status shape", async () => {
+		const stubDir = mkdtempSync(join(tmpdir(), "bd-stub-"));
+		const argsLog = join(stubDir, "args.log");
+		const bdStub = join(stubDir, "bd");
+		writeFileSync(
+			bdStub,
+			[
+				"#!/bin/sh",
+				`echo "$@" >> "${argsLog}"`,
+				"# bd show --json returns a single-element array of production-shaped issues",
+				'case "$1" in',
+				'  show) printf \'[{"id":"%s","title":"t","status":"in_progress","priority":1,"issue_type":"task"}]\\n\' "$2" ;;',
+				"  *) printf '{\"success\":true}\\n' ;;",
+				"esac",
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		chmodSync(bdStub, 0o755);
+
+		const clientPath = join(import.meta.dir, "..", "beads", "client.ts");
+		const runner = join(stubDir, "run-beads-claim.ts");
+		writeFileSync(
+			runner,
+			[
+				`import { createBeadsClient } from ${JSON.stringify(clientPath)};`,
+				"const c = createBeadsClient(process.argv[2]);",
+				'await c.claim("bead-42");',
+				'const s = await c.show("bead-42");',
+				"process.stdout.write(JSON.stringify({ status: s.status }));",
+				"",
+			].join("\n"),
+		);
+
+		const proc = Bun.spawnSync(["bun", "run", runner, stubDir], {
+			env: { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}` },
+		});
+		expect(proc.exitCode).toBe(0);
+		const out = JSON.parse(new TextDecoder().decode(proc.stdout));
+		// The production `bd show --json` array shape parsed to a non-terminal status.
+		expect(out.status).toBe("in_progress");
+		// The adapter's `claim()` emitted exactly `bd update <id> --status in_progress`.
+		const logged = await Bun.file(argsLog).text();
+		expect(logged).toContain("update bead-42 --status in_progress");
 	});
 });
